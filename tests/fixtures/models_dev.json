@@ -1,0 +1,94 @@
+{
+  "targetco": {
+    "id": "targetco",
+    "env": "TARGETCO_API_KEY",
+    "npm": "@targetco/sdk",
+    "api": "https://api.targetco.com/v1",
+    "name": "TargetCo",
+    "doc": "https://targetco.dev/docs",
+    "models": {
+      "tcl-2.0": {
+        "id": "tcl-2.0",
+        "name": "TC 2.0",
+        "release_date": "2024-05-01",
+        "tool_call": true,
+        "modalities": { "input": ["text"], "output": ["text"] },
+        "limit": { "context": 32000, "output": 4096 }
+      },
+      "tcl-3.5": {
+        "id": "tcl-3.5",
+        "name": "TC 3.5",
+        "release_date": "2025-06-01",
+        "tool_call": true,
+        "modalities": { "input": ["text"], "output": ["text"] },
+        "limit": { "context": 64000, "output": 8192 }
+      },
+      "tcl-4.0": {
+        "id": "tcl-4.0",
+        "name": "TC 4.0",
+        "release_date": "2025-11-01",
+        "tool_call": true,
+        "modalities": { "input": ["text"], "output": ["text"] },
+        "limit": { "context": 200000, "output": 16384 }
+      },
+      "tcl-4.1": {
+        "id": "tcl-4.1",
+        "name": "TC 4.1",
+        "release_date": "2026-02-10",
+        "tool_call": true,
+        "modalities": { "input": ["text", "image"], "output": ["text"] },
+        "limit": { "context": 400000, "output": 32768 }
+      },
+      "tcl-4.1-preview": {
+        "id": "tcl-4.1-preview",
+        "name": "TC 4.1 Preview",
+        "release_date": "2026-02-01",
+        "tool_call": false,
+        "modalities": { "input": ["text"], "output": ["text"] },
+        "limit": { "context": 400000, "output": 32768 }
+      },
+      "tcl-4": {
+        "id": "tcl-4",
+        "name": "TC 4 (legacy id)",
+        "release_date": "2025-10-01",
+        "tool_call": true,
+        "modalities": { "input": ["text"], "output": ["text"] },
+        "limit": { "context": 128000, "output": 8192 }
+      },
+      "tcl-04": {
+        "id": "tcl-04",
+        "name": "TC 04 (zero-padded id, same natural key as tcl-4)",
+        "release_date": "2025-12-20",
+        "tool_call": true,
+        "modalities": { "input": ["text"], "output": ["text"] },
+        "limit": { "context": 128000, "output": 8192 }
+      }
+    }
+  },
+  "aggco": {
+    "id": "aggco",
+    "env": "AGGCO_API_KEY",
+    "npm": "@aggco/sdk",
+    "api": "https://api.aggco.com/v1",
+    "name": "AggCo",
+    "doc": "https://aggco.dev/docs",
+    "models": {
+      "vendor/fast-1": {
+        "id": "vendor/fast-1",
+        "name": "Vendor Fast 1",
+        "release_date": "2025-03-01",
+        "tool_call": true,
+        "modalities": { "input": ["text"], "output": ["text"] },
+        "limit": { "context": 128000, "output": 8192 }
+      },
+      "vendor/fast-2": {
+        "id": "vendor/fast-2",
+        "name": "Vendor Fast 2",
+        "release_date": "2026-01-15",
+        "tool_call": true,
+        "modalities": { "input": ["text", "image"], "output": ["text"] },
+        "limit": { "context": 256000, "output": 16384 }
+      }
+    }
+  }
+}
