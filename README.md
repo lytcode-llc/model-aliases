@@ -462,8 +462,4 @@ Bugs and pull requests are welcome.
 
 ## License
 
-This repository does not currently include a LICENSE file, and no license has
-been granted. The code is copyright its author (see `plugin.yaml`), and the
-default copyright rules apply: no permission to copy, redistribute, sublicense
-or use the code commercially is given. Add a LICENSE file before publishing or
-sharing this plugin.
+[MIT](LICENSE) — Copyright (c) 2026 Paul Chason.
