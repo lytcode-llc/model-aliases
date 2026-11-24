@@ -49,12 +49,15 @@ rules rather than break the request.
 ## Install
 
 ```bash
+mkdir -p ~/.hermes/plugins/model-providers
 git clone <this-repo> ~/.hermes/plugins/model-providers/model-aliases
 ```
 
-or, for development, symlink the working copy:
+or, for development, symlink the working copy (run this **from the repo
+directory** — `$PWD` must be the repo, not your home folder):
 
 ```bash
+mkdir -p ~/.hermes/plugins/model-providers
 ln -s "$PWD" ~/.hermes/plugins/model-providers/model-aliases
 ```
 
