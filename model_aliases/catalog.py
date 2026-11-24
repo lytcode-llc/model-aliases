@@ -29,9 +29,22 @@ class ProviderDescriptor:
     api_key_env: str = ""  # env var holding Bearer token for live fetch
 
 
+DEFAULT_USER_AGENT = (
+    "model-aliases/0.1.0 (hermes-model-provider-plugin; "
+    "+https://github.com/lytcode-llc/model-aliases)"
+)
+
+
 def _fetch_json(url: str, *, headers: dict[str, str] | None = None, timeout: float = 3.0) -> object:
-    """GET ``url`` and parse the body as JSON. Raises on HTTP/network/JSON errors."""
-    req = urllib.request.Request(url, headers=headers or {})
+    """GET ``url`` and parse the body as JSON. Raises on HTTP/network/JSON errors.
+
+    Sends a descriptive User-Agent unless the caller provides one: models.dev
+    and several provider endpoints 403 the stock Python-urllib agent, which
+    silently emptied the candidate catalog."""
+    merged: dict[str, str] = dict(headers or {})
+    if not any(k.lower() == "user-agent" for k in merged):
+        merged["User-Agent"] = DEFAULT_USER_AGENT
+    req = urllib.request.Request(url, headers=merged)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = resp.read(MAX_RESPONSE_BYTES + 1)
     if len(body) > MAX_RESPONSE_BYTES:

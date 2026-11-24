@@ -65,6 +65,37 @@ def test_fetch_live_no_endpoint() -> None:
     assert fetch_live_ids(ProviderDescriptor(name="x", base_url="", models_url="")) is None
 
 
+def test_fetch_json_sends_user_agent_by_default(monkeypatch) -> None:
+    """models.dev 403s the stock urllib agent — a missing UA emptied catalogs."""
+    from model_aliases import catalog
+
+    seen: dict[str, str] = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, *_a):
+            return b'{"ok": true}'
+
+    def fake_urlopen(req, timeout=None):
+        seen.update({k.lower(): v for k, v in req.header_items()})
+        return _Resp()
+
+    monkeypatch.setattr(catalog.urllib.request, "urlopen", fake_urlopen)
+    assert catalog._fetch_json("https://example.invalid/x") == {"ok": True}
+    assert "user-agent" in seen
+    assert "model-aliases" in seen["user-agent"]
+
+    # caller-provided User-Agent wins
+    seen.clear()
+    catalog._fetch_json("https://example.invalid/x", headers={"User-Agent": "custom/1"})
+    assert seen["user-agent"] == "custom/1"
+
+
 def test_fetch_live_rows(monkeypatch) -> None:
     seen: dict = {}
 
