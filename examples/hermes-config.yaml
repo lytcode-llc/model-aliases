@@ -1,0 +1,32 @@
+# model_aliases block for ~/.hermes/config.yaml
+#
+# Port of the opencode-model-aliases aliases from opencode.jsonc: each alias
+# resolves to the newest matching model on the opencode-go provider at startup.
+# In Hermes the alias ids are scoped to the profile, so the OpenCode keys lose
+# their provider prefix: "opencode-go/glm-latest" -> "glm-latest".
+#
+# Usage after merging this into config.yaml:
+#   model:
+#     provider: alias-oc
+#     default: glm-latest
+# or switch in-session: /model alias-oc:glm-latest
+
+model_aliases:
+  targets:
+    oc:
+      provider: opencode-go
+      aliases:
+        glm-latest:
+          match: ["opencode-go/glm-*"]
+        glm-flash-latest:
+          match: ["opencode-go/glm-*-flash"]
+        kimi-code-latest:
+          match: ["opencode-go/kimi-*-code"]
+        mimo-pro-latest:
+          match: ["opencode-go/mimo-*-pro"]
+        mimo-flash-latest:
+          match: ["opencode-go/mimo-*-flash"]
+        minimax-latest:
+          match: ["opencode-go/minimax-*"]
+        minimax-flash-latest:
+          match: ["opencode-go/minimax-*-flash"]
