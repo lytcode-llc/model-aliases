@@ -280,7 +280,7 @@ def test_resolve_group_provider_slug_prefix_custom_entry():
 def test_resolve_group_provider_default_model_slug_prefix():
     full = {
         "custom_providers": [
-            {"name": "work", "api": "http://work.example/v1", "default_model": "opencode-go-xyz"},
+            {"name": "work", "api": "http://work.example/v1", "default_model": "opencode-go/xyz"},
         ],
     }
     group = ProviderGroup(key="ocg-alias", provider="opencode-go", aliases={"fast": AliasSpec(match=("tcl-*",))})
@@ -565,3 +565,43 @@ def test_register_all_custom_entry_alias_model_strict_error(
     with pytest.raises(RuntimeError, match="work.*fast|fast.*work"):
         _run_register_all(monkeypatch, tmp_path, raw, full)
     assert stub_providers == []
+
+
+def test_early_return_reason_canonicalization(monkeypatch):
+    """The guard's second mechanism: names Hermes' provider-alias
+    canonicalization rewrites (normalize_provider lowercases + alias table,
+    e.g. local -> custom) never reach a profile registered under that name."""
+    _install_fake_hermes(monkeypatch, canonical="ocg-alias")
+    reason = early_return_reason("OCG-Alias")
+    assert reason is not None
+    assert "canonicaliz" in reason
+    assert "ocg-alias" in reason
+
+
+def test_group_key_collision_with_bundled_provider_rejected(tmp_path, monkeypatch, stub_providers):
+    """A group key that IS a bundled provider name would shadow the real
+    profile — the guard rejects it before any registration."""
+    fake = types.SimpleNamespace(
+        name="gemini", api_mode="chat_completions", supports_vision=False,
+        auth_type="api_key", env_vars=(), base_url="https://x/v1", models_url="", models_dev_id="",
+    )
+    pkg = sys.modules["providers"]
+    pkg.get_provider_profile = lambda name: fake if name == "gemini" else None
+    _install_fake_hermes(monkeypatch, canonical=None)
+    raw = {"provider_alias_to_many_model_aliases": {"gemini": {"provider": "gemini", "m": {"match": ["m*"]}}}}
+    with pytest.raises(ConfigError, match="shadow"):
+        _run_register_all(monkeypatch, tmp_path, raw, {})
+    assert stub_providers == []
+
+
+def test_ladder_prefix_boundary(tmp_path, monkeypatch, stub_providers, caplog):
+    """Ladder (c) must not match 'gptx-9b' for prefix 'gpt' (boundary = '/' or exact).
+    The entry itself is still wrapped — custom_providers entries are wrapped
+    regardless of groups."""
+    raw = {"provider_alias_to_many_model_aliases": {"pfx": {"provider": "gpt", "m": {"match": ["gpt*"]}}}}
+    full = {"custom_providers": [{"name": "gptx", "api": "https://x/v1", "model": "gptx-9b"}]}
+    _install_fake_hermes(monkeypatch, canonical=None)
+    _run_register_all(monkeypatch, tmp_path, raw, full)
+    assert [p.name for p in stub_providers] == ["gptx"]  # sweep wraps the entry
+    # the GROUP failed the boundary rule and was reported
+    assert any("slug prefix 'gpt'" in r.message for r in caplog.records), caplog.records

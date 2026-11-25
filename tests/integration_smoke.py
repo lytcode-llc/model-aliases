@@ -158,6 +158,31 @@ def main() -> int:
     else:
         raise AssertionError("naming guard must fail the load for an early-return group name")
 
+    # 6b. The canonicalization branch of the guard: names Hermes rewrites
+    # (normalize_provider lowercases + alias table, e.g. local -> custom)
+    # never reach a profile registered under that name.
+    time.sleep(0.05)
+    _write_config(
+        home,
+        "model_aliases:\n"
+        "  provider_alias_to_many_model_aliases:\n"
+        "    local:\n"
+        "      provider: local\n"
+        "      glm-latest:\n"
+        "        match: ['glm-*']\n"
+        "model:\n"
+        "  provider: local-alias\n"
+        "custom_providers:\n"
+        "  - name: local-alias\n"
+        "    api: http://127.0.0.1:9/v1\n",
+    )
+    try:
+        register_all()
+    except Exception as e:
+        assert "local" in str(e) and "canonicaliz" in str(e), f"canonicalization guard must fire: {e}"
+    else:
+        raise AssertionError("canonicalization guard must fail the load for a rewritten group name")
+
     # 7. Strict mode: an alias that matches nothing must fail registration loudly.
     time.sleep(0.05)
     _write_config(

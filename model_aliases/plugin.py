@@ -251,26 +251,36 @@ def resolve_group_provider(group: ProviderGroup, full: dict) -> tuple[str, dict 
         )
         return group.provider, None, prof, desc
 
-    # (c) custom entry whose model slug carries the prefix
+    # (c) custom entry whose model slug carries the prefix (boundary: the
+    # prefix must end the slug or be followed by '/', so 'gpt' never matches
+    # 'gptx-9b')
     prefix = group.provider
+    matches: list[tuple[str, dict]] = []
     for block in (full.get("custom_providers"), full.get("providers")):
         items = block if isinstance(block, list) else list((block or {}).values())
         for item in items:
             if not isinstance(item, dict):
                 continue
             slug = str(item.get("model") or item.get("default_model") or "").strip()
-            if slug.startswith(prefix):
-                name = str(item.get("name") or prefix).strip()
-                prof = build_custom_profile(name, item)
-                if not prof.base_url:
-                    raise TargetError(f"provider alias {group.key!r}: custom entry has no api/base_url")
-                desc = ProviderDescriptor(
-                    name=name,
-                    base_url=prof.base_url,
-                    models_dev_id=prof.models_dev_id,
-                    api_key_env=str(item.get("key_env") or item.get("api_key_env") or "").strip(),
-                )
-                return name, item, prof, desc
+            if slug == prefix or slug.startswith(prefix + "/"):
+                matches.append((str(item.get("name") or prefix).strip(), item))
+    if len(matches) > 1:
+        logger.warning(
+            "model-aliases: slug prefix %r matches %d custom entries; using the first (%r)",
+            prefix, len(matches), matches[0][0],
+        )
+    if matches:
+        name, item = matches[0]
+        prof = build_custom_profile(name, item)
+        if not prof.base_url:
+            raise TargetError(f"provider alias {group.key!r}: custom entry has no api/base_url")
+        desc = ProviderDescriptor(
+            name=name,
+            base_url=prof.base_url,
+            models_dev_id=prof.models_dev_id,
+            api_key_env=str(item.get("key_env") or item.get("api_key_env") or "").strip(),
+        )
+        return name, item, prof, desc
 
     raise TargetError(
         f"provider alias {group.key!r}: slug prefix {group.provider!r} matches no bundled "
@@ -346,6 +356,7 @@ def resolve_target(
     new_map = resolve_aliases(alias_map, md_cands, provider=name)
     unresolved = [a for a in alias_map if not new_map.get(a)]
     live_rows = None
+    cands = md_cands
     if force_live or stale or unresolved:
         live_rows = fetch_live_ids(desc, timeout=live_timeout)
         if live_rows is not None:
@@ -362,7 +373,7 @@ def resolve_target(
     caps = _capability_meta(md, key, resolved)
     if caps and caps != merged.capabilities:
         merged.capabilities = caps
-    real_ids = [c.id for c in (merge_candidates(md_cands, live_rows) if live_rows is not None else md_cands)]
+    real_ids = [c.id for c in cands]
     if real_ids:
         merged.real_ids = real_ids
     changed = merged.resolved != (prev.resolved if prev else {}) or merged.real_ids != (prev.real_ids if prev else [])
@@ -448,6 +459,8 @@ def register_all() -> None:
         cfg = parse(raw)
     except ConfigError as e:
         logger.error("model-aliases: invalid config: %s", e)
+        if isinstance(raw, dict) and raw.get("strict") is True:
+            raise  # strict must not silently disable aliases on a schema typo
         return
     if not cfg.groups and not cfg.aliases:
         return
@@ -457,10 +470,28 @@ def register_all() -> None:
         logger.error("model-aliases: provider registry unavailable: %s", e)
         return
 
-    # Naming guard: a group name that Hermes' normalization would early-return
-    # is a silent-runtime-failure waiting to happen — fail at load instead.
+    # Naming guard: a group name that Hermes' normalization would never route
+    # to a profile is a silent-runtime-failure waiting to happen — fail at load.
     for gkey in cfg.groups:
-        reason = early_return_reason(gkey)
+        if gkey.lower() in {"custom", "auto", "none"}:
+            reason = "a reserved bucket name"
+        else:
+            reason = early_return_reason(gkey)
+            if reason is None:
+                # a group key that IS a bundled provider name would shadow the
+                # real profile (last-writer-wins registration under one name).
+                # Guard only genuine name matches: the generic 'custom' fallback
+                # (name != group key) is not a collision, and profiles carrying
+                # our wrap marker (_alias_ids) are our own earlier registrations.
+                from providers import get_provider_profile
+
+                prof = get_provider_profile(gkey)
+                if (
+                    prof is not None
+                    and prof.name == gkey
+                    and not hasattr(prof, "_alias_ids")
+                ):
+                    reason = f"the bundled provider name {gkey!r} (it would shadow the real profile)"
         if reason is not None:
             msg = (
                 f"provider alias {gkey!r}: this name falls into {reason}, whose normalization "
@@ -488,6 +519,13 @@ def register_all() -> None:
         t = targets.setdefault(
             tname, {"entry": entry, "prof": prof, "desc": desc, "groups": {}, "is_custom": entry is not None}
         )
+        for prev_key, prev_aliases in t["groups"].items():
+            clash = next((s for s in group.aliases if s in prev_aliases), None)
+            if clash is not None:
+                logger.warning(
+                    "model-aliases: group %r overrides group %r alias %r on %s",
+                    group.key, prev_key, clash, tname,
+                )
         t["groups"][group.key] = group.aliases
 
     for name, entry in referenced_providers(full, cfg).items():
@@ -564,19 +602,20 @@ def register_all() -> None:
             logger.debug("model-aliases: wrap for %s failed", name, exc_info=True)
 
     # --- custom entries whose model/default_model is a known alias: validate ---
-    all_known = {s.lower() for s in cfg.aliases}
-    for t in targets.values():
-        for galiases in t["groups"].values():
-            all_known.update(s.lower() for s in galiases)
-    for name, t in targets.items():
+    for idx, (name, t) in enumerate(targets.items()):
         entry = t["entry"]
         if not entry:
             continue
         slug = str(entry.get("model") or entry.get("default_model") or "").strip().lower()
-        if not slug or slug not in all_known:
-            continue  # concrete id (or empty) — nothing to validate
-        result = results.get(list(targets.keys()).index(name))
-        if result is not None and slug in {s.lower() for s in result[0]}:
+        target_known = {s.lower() for s in cfg.aliases}
+        for galiases in t["groups"].values():
+            target_known.update(s.lower() for s in galiases)
+        if not slug or slug not in target_known:
+            continue  # concrete id (or empty / another target's alias) — nothing to validate
+        result = results.get(idx)
+        if result is None:
+            continue  # resolve already reported this target's failure
+        if slug in {s.lower() for s in result[0]}:
             continue  # resolved on this provider — normal
         msg = (
             f"custom provider {name!r}: model {slug!r} is a known alias but matched no "

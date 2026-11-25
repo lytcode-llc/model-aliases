@@ -205,6 +205,7 @@ def parse(raw: dict | None) -> AliasesConfig:
         gpath = f"provider_alias_to_many_model_aliases.{gkey}"
         if not isinstance(gkey, str) or not gkey.strip():
             _err("provider_alias_to_many_model_aliases", "group names must be non-empty strings")
+        gkey = gkey.strip()
         groups[gkey] = _parse_group(gpath, gkey, gval)
 
     aliases: dict[str, AliasSpec] = {}
