@@ -372,7 +372,7 @@ most providers, but a few families return before they do:
 | Family | What `normalize_model_for_provider()` returns |
 | --- | --- |
 | `openrouter`, `nous`, `ai-gateway`, `kilocode` | The vendor-prefixed id (`z-ai/glm-latest`). |
-| `opencode-go`, `opencode-zen` | The name unchanged. |
+| `opencode-go`, `opencode-zen` | The name unchanged. (A custom provider whose name starts with a family slug — e.g. `opencode-go-bridge` — early-returns the same way.) |
 | `anthropic` | The name with dots replaced by hyphens. |
 
 On those providers the alias id is still translated when you pick it in `/model`, because
@@ -491,8 +491,12 @@ To see the drift lines, read the Hermes logs (`hermes logs`, i.e.
 - `x_search.model` is not normalized, see [Support matrix](#support-matrix).
 - On the provider families listed in
   [Provider families that ask the profile later](#provider-families-that-ask-the-profile-later),
-  `model.default`, the auxiliary tasks and the fallbacks keep the literal alias id. `/model`
-  resolves it.
+  `model.default`, the auxiliary tasks and the fallbacks need the neutral
+  `alias-<provider>` name (the real name keeps the literal alias id; `/model` resolves it).
+- The neutral `alias-<provider>` name forfeits the family's real-id repairs: under
+  `alias-anthropic` a dotted id (`claude-3.5-sonnet`) is no longer hyphenated, and under
+  `alias-opencode-go` a vendor-prefixed id (`z-ai/glm-5.3-flash`) is no longer stripped.
+  Use the real provider name for those concrete ids.
 - A provider block that fetches its key with `key_cmd` gives this plugin no env var to
   use. Declare `key_env` on the block instead.
 - Alias display names are not customizable. The picker shows the alias id.

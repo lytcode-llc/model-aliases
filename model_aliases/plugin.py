@@ -103,10 +103,14 @@ def _cache_key(provider_name: str) -> str:
 
 def _add_referenced(store: dict[str, Any], provider: Any, entry: dict | None) -> None:
     name = str(provider or "").strip()
-    if not name or name.lower() in {"auto", "none"}:
-        return
+    if not name or name.lower() in {"auto", "none", "custom"}:
+        return  # 'custom' is the generic bucket — wrapping it logs noise forever
     if name not in store:
         store[name] = entry  # first mention wins; entry None = bundled
+
+
+def _is_provider_block(item: Any) -> bool:
+    return isinstance(item, dict) and any(k in item for k in ("api", "base_url", "url"))
 
 
 def _custom_entry_for(name: str, full: dict) -> dict | None:
@@ -119,7 +123,7 @@ def _custom_entry_for(name: str, full: dict) -> dict | None:
                     return item
         elif isinstance(block, dict):
             item = block.get(bare)
-            if isinstance(item, dict) and ("api" in item or "base_url" in item or "url" in item):
+            if _is_provider_block(item):
                 return item
     return None
 
@@ -156,7 +160,7 @@ def referenced_providers(full: dict, cfg: AliasesConfig) -> dict[str, dict | Non
                     _add_referenced(store, str(item["name"]).strip(), item)
         elif isinstance(block, dict):
             for key, item in block.items():
-                if isinstance(item, dict) and ("api" in item or "base_url" in item):
+                if _is_provider_block(item):
                     _add_referenced(store, key, item)
 
     if cfg.wrap_all:
@@ -303,7 +307,12 @@ def resolve_provider(
         logger.error("model-aliases: %s", msg)
     if cfg.debug:
         logger.info("model-aliases: %s resolved %s", name, resolved)
-    return resolved, caps, _rid_meta(resolved, caps), real_ids
+    # A failed fresh pass must not drop what state.merge preserved: caps and
+    # real_ids fall back to the last-known-good values (the wrap then keeps
+    # the last good picker/metadata until a refresh succeeds).
+    final_caps = caps or merged.capabilities
+    final_real = real_ids or list(merged.real_ids)
+    return resolved, final_caps, _rid_meta(resolved, final_caps), final_real
 
 
 def make_refresh(
@@ -387,13 +396,21 @@ def register_all() -> None:
     # miss (the alias exists only once the wrap registers).
     resolved_refs: dict[str, Any] = {}
     for name, entry in referenced.items():
-        real = name
+        real, resolved_entry = name, entry
         if entry is None and name.startswith("alias-"):
             from providers import get_provider_profile
 
-            if get_provider_profile(name[len("alias-"):]) is not None:
-                real = name[len("alias-"):]
-        resolved_refs.setdefault(real, entry)
+            base = name[len("alias-"):]
+            if get_provider_profile(base) is not None:
+                real = base
+            else:
+                custom = _custom_entry_for(base, full)
+                if custom is not None:
+                    real, resolved_entry = base, custom
+        # a concrete entry beats a bundled None on collision (first-mention
+        # order must not shadow a custom entry behind an alias- reference)
+        if real not in resolved_refs or (resolved_refs[real] is None and resolved_entry is not None):
+            resolved_refs[real] = resolved_entry
     for name, entry in resolved_refs.items():
         try:
             prof, desc = describe_provider(name, entry, full)

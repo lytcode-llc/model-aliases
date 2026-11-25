@@ -357,3 +357,15 @@ def test_alias_provider_reference_resolves_back_for_wrapping(tmp_path, monkeypat
     # glm-* matches nothing in the targetco fixture — unresolved alias stays
     # literal (the registration + neutral name are what this test proves)
     assert p.normalize_model_id("glm-latest") is None
+
+
+def test_alias_prefix_edges(tmp_path, monkeypatch, stub_providers):
+    """alias-alias-x and alias-unknown fail loudly (tolerant: logged, nothing
+    registered for them) instead of silently wrapping the wrong thing."""
+    raw = {"glm-latest": {"match": ["glm-*"]}}
+    full = {"model": {"provider": "alias-alias-x"}}
+    _run_register_all(monkeypatch, tmp_path, raw, full)
+    assert stub_providers == []
+    full2 = {"model": {"provider": "alias-nope"}}
+    _run_register_all(monkeypatch, tmp_path, raw, full2)
+    assert stub_providers == []

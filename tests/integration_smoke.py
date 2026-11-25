@@ -117,6 +117,18 @@ def main() -> int:
     via_alias = get_provider_profile("custom:local")
     assert via_alias is profile, "custom:local profile alias must resolve to the same profile"
 
+    # The request-path seam: generic normalization dispatches to the neutral
+    # name (the direct-profile call above would mask an early-return family
+    # regression — this is the path agent-init/aux/fallback actually take).
+    from hermes_cli.model_normalize import normalize_model_for_provider
+
+    assert normalize_model_for_provider("glm-latest", "alias-local") == "glm-4.7"
+    # Pin the three early-return families (README's table): they transform or
+    # pass the literal id WITHOUT consulting any profile.
+    assert normalize_model_for_provider("glm-latest", "opencode-go") == "glm-latest"
+    assert normalize_model_for_provider("glm-latest", "anthropic") == "glm-latest"  # no dots to convert
+    assert normalize_model_for_provider("glm-latest", "openrouter") != "glm-latest"  # vendor-prefixed
+
     # Strict mode: an alias that matches nothing must fail registration loudly.
     time.sleep(0.05)  # beat config mtime+size caching
     _write(
