@@ -84,13 +84,25 @@ The wrapped profile is registered under the target's registered name (the real
 provider name for a bundled target, the group key for a name-join custom target), and
 it **claims** the other names that must reach it:
 
-- every group name targeting it (your provider alias),
 - `custom:<name>`, when the target is a custom entry.
 
-So `provider: ocg-alias` finds the wrapped `opencode-go` profile, because the profile
-is registered under `opencode-go` and `ocg-alias` is one of its claimed aliases. There
-is one wrap per target, not per group: two groups that resolve to the same target
-share one wrapped profile, and both group names are claimed by it.
+The **group wrap's primary name is the group key itself** — this is load-bearing.
+Hermes' `resolve_provider()` canonicalizes provider aliases to the profile's *name*
+before building the runtime, so a wrap registered under the target name would hand
+agent-init `opencode-go` (an early-return family) and the alias would never resolve.
+Registering `ocg-alias` as the name means the canonical name dodges the early-return
+families by construction:
+
+```
+resolve_provider("ocg-alias") -> ocg-alias   (not opencode-go)
+runtime.provider = "ocg-alias"               auth + endpoint from the wrap's copied fields
+agent-init normalize("glm-latest", "ocg-alias") -> glm-5.3-flash
+```
+
+A second wrap under the **target name** serves the `/model` picker and real-name
+consumers (concrete ids on early-return families still flow through the bundled
+profile's own repairs). Two groups that resolve to the same target share one
+resolution (one cache file, one state) but each gets its own group-name wrap.
 
 ### 2. The two scopes
 
@@ -592,6 +604,7 @@ ids on top.
 | `model-aliases: provider alias 'ocg-alias': slug prefix 'opencode-go' matches no bundled provider and no custom_providers entry` | The group's `provider` prefix matches nothing. | Fix the prefix, or join the group to a `custom_providers` entry by name. See [the slug-prefix ladder](#3-naming-a-group-the-slug-prefix-ladder). |
 | `model-aliases: provider 'opencode-go': alias(es) 'glm-latest' matched no models (check match globs against the catalog)` | No candidate matched `match`, or every candidate was excluded or filtered out. | Turn on `debug: true` and check the resolved map. Widen `match`, drop an over-strict `exclude`, or relax `filter` (unknown context or tool support fails a requirement). |
 | `model-aliases: alias 'glm-latest' matched no models on 'opencode-go'` | The alias is known but resolved to nothing on this provider. Logged once per (provider, alias) pair, the first time the alias is looked up there. | Same as above: the glob matches nothing this provider serves. |
+| `hermes_cli.runtime_provider: Primary provider auth failed (Unknown provider '<group>'). Falling back to ...` | The **running gateway process** predates the plugin/config change: Hermes discovers model-provider plugins once per process and never re-imports them, so a long-lived gateway holds the old registration. A new chat session reuses that same process — launching one does not reload plugins. | Restart the gateway process, then start a new session. (After plugin or `model_aliases:` edits, always restart the gateway — not just the chat.) |
 | `model-aliases: custom provider 'fw-alias': model 'kimi-code-latest' is a known alias but matched no models on this provider (check match globs against the catalog)` | A custom entry's `model` or `default_model` holds a known alias that resolves to nothing there. | Widen the alias's `match`, or point the entry at a concrete id. |
 | The alias resolves but the agent reports an unknown model | The resolved id is not served by the provider, for example a catalog entry the endpoint does not implement. | Narrow `match` to the ids the endpoint really serves, or point `catalog_provider` at the right models.dev entry. |
 | The alias points at an old model after the provider released a new one | The cached resolution is younger than `refresh_seconds`. | Lower `refresh_seconds`, delete `~/.hermes/cache/model-aliases/opencode-go.json`, or open the `/model` picker, which forces a live refresh. |
