@@ -120,6 +120,11 @@ def wrap_profile(
     if extra_aliases:
         prof.aliases = tuple(dict.fromkeys([*(getattr(target, "aliases", ()) or ()), *extra_aliases]))
     prof._alias_ids = tuple(aliases.keys())
+    # The /model picker's curated floor reads static_models || fallback_models
+    # per plugin profile; without these a live-catalog target (empty static list)
+    # leaves the picker's floor empty and it shows only the active model.
+    prof.static_models = tuple(aliases.keys())
+    prof.fallback_models = tuple(aliases.keys())
     prof._alias_names_lower = {a.lower() for a in aliases}
     prof._resolved = dict(resolved)
     prof._resolved_lower = {k.lower(): v for k, v in resolved.items()}

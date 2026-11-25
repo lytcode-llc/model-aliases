@@ -236,3 +236,17 @@ def test_build_custom_profile_default_api_mode():
 def test_extra_aliases_appended():
     p = _wrap(_target(aliases=("existing",)), extra_aliases=("custom:test-provider",))
     assert p.aliases == ("existing", "custom:test-provider")
+
+
+def test_wrap_profile_sets_picker_curated_floor():
+    """The /model picker's curated floor reads static_models || fallback_models
+    per plugin profile; without it a live-catalog target (empty static list)
+    leaves the floor empty and the picker shows only the active model."""
+    p = _wrap()
+    assert p.static_models == ("fast", "stable")
+    assert p.fallback_models == ("fast", "stable")
+    # shadow wins over a non-empty bundled static list
+    t = _target(static_models=("bundled-1",), fallback_models=("bundled-1",))
+    p2 = _wrap(t)
+    assert p2.static_models == ("fast", "stable")
+    assert p2.fallback_models == ("fast", "stable")

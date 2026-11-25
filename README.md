@@ -78,6 +78,7 @@ original with three methods shadowed on the instance.
 | --- | --- |
 | `normalize_model_id()` | Maps an alias to the resolved concrete id. Pure dict lookup, no I/O. Returns `None` for real ids, so Hermes' generic normalization handles them unchanged. |
 | `fetch_models()` | Returns the provider's real model ids plus the alias ids, for the `/model` picker. Forces a live re-resolution first, and a failed refresh keeps the current snapshot. |
+| `static_models` / `fallback_models` | Set to the alias ids — the picker's **curated floor** (`_build_curated_lists` reads these per plugin profile), so aliases are listed even when the live `/models` fetch fails or returns nothing. |
 | `live_context_length()` | Returns the context window of the resolved target model. |
 
 The wrapped profile is registered under the target's registered name (the real

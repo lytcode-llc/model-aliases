@@ -123,6 +123,8 @@ def main() -> int:
     assert rows[:2] == ["glm-4.6", "glm-4.7"], f"real ids first: {rows!r}"
     assert "glm-latest" in rows, f"alias ids must be in picker rows: {rows!r}"
 
+    _assert_picker_floor(profile)
+
     # 5. The request-path seam: generic normalization dispatches through the
     # group name (the direct-profile calls above would mask an early-return
     # family regression).
@@ -209,6 +211,20 @@ def main() -> int:
 
     print("integration smoke: OK (name-join, normalize, passthrough, picker, seam, guard, strict)")
     return 0
+
+
+
+def _assert_picker_floor(profile) -> None:
+    """Regression: /model's curated floor must list the aliases for the group
+    provider (curated['ocg-alias'] was None when static/fallback were empty)."""
+    assert profile.static_models == ("glm-latest",), profile.static_models
+    assert profile.fallback_models == ("glm-latest",), profile.fallback_models
+    from hermes_cli.model_switch_providers import _build_curated_lists
+
+    curated = _build_curated_lists(profile.name, profile.base_url, "glm-latest")
+    assert "glm-latest" in (curated.get(profile.name) or []), (
+        f"curated floor for {profile.name!r} missing the alias: {curated.get(profile.name)}"
+    )
 
 
 if __name__ == "__main__":
