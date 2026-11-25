@@ -40,7 +40,7 @@ def _target(**kw):
     return _FakeProviderProfile(**defaults)
 
 
-def _wrap(target=None, *, resolved=None, caps=None, rid_meta=None, real_ids=None, refresh=None, extra_aliases=()):
+def _wrap(target=None, *, resolved=None, caps=None, rid_meta=None, real_ids=None, refresh=None, extra_aliases=(), picker_alias_only=False):
     return wrap_profile(
         target or _target(),
         provider_name="test-provider",
@@ -51,6 +51,7 @@ def _wrap(target=None, *, resolved=None, caps=None, rid_meta=None, real_ids=None
         real_ids=real_ids if real_ids is not None else ["tcl-4.1", "glm-4.7"],
         refresh=refresh,
         extra_aliases=extra_aliases,
+        picker_alias_only=picker_alias_only,
     )
 
 
@@ -250,3 +251,13 @@ def test_wrap_profile_sets_picker_curated_floor():
     p2 = _wrap(t)
     assert p2.static_models == ("fast", "stable")
     assert p2.fallback_models == ("fast", "stable")
+
+
+def test_picker_alias_only_group_wrap_lists_only_aliases():
+    """A GROUP wrap's picker rows are the alias table only; the real catalog
+    belongs to the target's own row (canonical-path rows call fetch_models)."""
+    p = _wrap(picker_alias_only=True)
+    assert p.fetch_models() == ["fast", "stable"]  # no real ids
+    # target wrap keeps real + alias ids
+    p2 = _wrap()
+    assert p2.fetch_models() == ["tcl-4.1", "glm-4.7", "fast", "stable"]

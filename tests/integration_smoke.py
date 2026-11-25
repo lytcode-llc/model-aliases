@@ -120,8 +120,9 @@ def main() -> int:
 
     # 4. Picker: real ids + alias ids.
     rows = profile.fetch_models()
-    assert rows[:2] == ["glm-4.6", "glm-4.7"], f"real ids first: {rows!r}"
-    assert "glm-latest" in rows, f"alias ids must be in picker rows: {rows!r}"
+    # A GROUP wrap lists ONLY its alias table (the real catalog belongs to the
+    # target's own row); the canonical picker path calls fetch_models directly.
+    assert rows == ["glm-latest"], f"group picker rows must be alias-only: {rows!r}"
 
     _assert_picker_floor(profile)
 

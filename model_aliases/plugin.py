@@ -605,6 +605,7 @@ def register_all() -> None:
                         real_ids=real_ids,
                         refresh=refresh,
                         extra_aliases=extra,
+                        picker_alias_only=True,  # group rows list ONLY the alias table
                     )
                 )
             except Exception as e:

@@ -53,9 +53,12 @@ def _fetch_models(
     base_url: str | None = None,
     timeout: float = 8.0,
 ) -> list[str] | None:
-    """Real model ids + alias ids for the /model picker. Refreshes resolution
-    (network allowed here) and swaps state atomically; a failed refresh keeps
-    the current snapshot."""
+    """Model ids for the /model picker. Refreshes resolution (network allowed
+    here) and swaps state atomically; a failed refresh keeps the current
+    snapshot. A GROUP wrap lists ONLY its alias table — the real catalog
+    belongs to the target's own row (canonical-path rows call fetch_models,
+    which would otherwise inject the raw ids); a target wrap lists real ids
+    + aliases."""
     if prof._refresh is not None:
         try:
             out = prof._refresh(timeout)
@@ -74,6 +77,8 @@ def _fetch_models(
                 prof._rid_meta = {k: dict(v) for k, v in fresh_rid.items() if isinstance(v, dict)}
             if fresh_real:
                 prof._real_ids = [str(x) for x in fresh_real]
+    if getattr(prof, "_picker_alias_only", False):
+        return list(prof._alias_ids)
     return list(dict.fromkeys(list(prof._real_ids) + list(prof._alias_ids)))
 
 
@@ -109,6 +114,7 @@ def wrap_profile(
     real_ids: list[str],
     refresh: Callable[[float | None], tuple[dict, dict, dict, list] | None],
     extra_aliases: tuple[str, ...] = (),
+    picker_alias_only: bool = False,
 ) -> Any:
     """Wrap a target profile (bundled or custom-built) under ``provider_name``.
 
@@ -133,6 +139,7 @@ def wrap_profile(
     prof._rid_meta = {k: dict(v) for k, v in rid_meta.items() if isinstance(v, dict)}
     prof._real_ids = list(real_ids)
     prof._refresh = refresh
+    prof._picker_alias_only = bool(picker_alias_only)
     prof._warned_unmatched: set[tuple[str, str]] = set()
     prof.normalize_model_id = types.MethodType(_normalize, prof)
     prof.fetch_models = types.MethodType(_fetch_models, prof)
