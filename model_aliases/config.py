@@ -1,4 +1,9 @@
-"""Pure configuration model for the ``model_aliases:`` config section."""
+"""Parse the flat ``model_aliases:`` section of ~/.hermes/config.yaml (pure).
+
+v2 schema: a flat global alias table. Top-level keys (except the reserved
+``wrap_all``) are alias slugs; values are alias specs. There is no provider
+scoping — aliases resolve against whatever provider a consumer block names.
+"""
 
 from __future__ import annotations
 
@@ -25,18 +30,12 @@ class AliasSpec:
 
 
 @dataclass(frozen=True)
-class TargetSpec:
-    key: str
-    provider: str
-    aliases: dict[str, AliasSpec]
-
-
-@dataclass(frozen=True)
 class AliasesConfig:
+    wrap_all: bool = False
     strict: bool = False
     debug: bool = False
     refresh_seconds: int = 3600
-    targets: dict[str, TargetSpec] = field(default_factory=dict)
+    aliases: dict[str, AliasSpec] = field(default_factory=dict)
 
 
 _MIN_AGE_RE = re.compile(r"^[0-9]+(h|d)$")
@@ -91,7 +90,6 @@ def _parse_alias(path: str, raw: Any) -> AliasSpec:
         flt = raw["filter"]
         if not isinstance(flt, dict):
             _err(fpath, f"expected a mapping, got {type(flt).__name__}")
-        assert isinstance(flt, dict)
         _unknown(fpath, flt, {"minContext", "capabilities", "minAge"})
         if "minContext" in flt:
             mc = flt["minContext"]
@@ -124,7 +122,6 @@ def _parse_alias(path: str, raw: Any) -> AliasSpec:
         sel = raw["select"]
         if not isinstance(sel, dict):
             _err(spath, f"expected a mapping, got {type(sel).__name__}")
-        assert isinstance(sel, dict)
         _unknown(spath, sel, {"strategy"})
         strategy = sel.get("strategy")
         if strategy != "latest":
@@ -142,14 +139,17 @@ def _parse_alias(path: str, raw: Any) -> AliasSpec:
 
 
 def parse(raw: dict | None) -> AliasesConfig:
-    """Parse the ``model_aliases:`` section. ``{}``/``None`` -> defaults (no targets)."""
+    """Parse the ``model_aliases:`` section. ``{}``/``None`` -> defaults (no aliases)."""
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
         _err("model_aliases", f"expected a mapping, got {type(raw).__name__}")
-    assert isinstance(raw, dict)
-    _unknown("model_aliases", raw, {"strict", "debug", "refresh_seconds", "targets"})
+    # Every non-reserved top-level key is an alias slug by definition —
+    # unknown-key validation lives in _parse_alias on each value's shape.
 
+    wrap_all = raw.get("wrap_all", False)
+    if not isinstance(wrap_all, bool):
+        _err("wrap_all", "expected a boolean")
     strict = raw.get("strict", False)
     if not isinstance(strict, bool):
         _err("strict", "expected a boolean")
@@ -160,33 +160,18 @@ def parse(raw: dict | None) -> AliasesConfig:
     if not isinstance(refresh, int) or isinstance(refresh, bool) or refresh <= 0:
         _err("refresh_seconds", "expected a positive integer")
 
-    targets_raw = raw.get("targets", {})
-    if not isinstance(targets_raw, dict):
-        _err("targets", f"expected a mapping, got {type(targets_raw).__name__}")
+    reserved = {"wrap_all", "strict", "debug", "refresh_seconds"}
+    aliases: dict[str, AliasSpec] = {}
+    for key, spec_raw in raw.items():
+        if key in reserved:
+            continue
+        apath = f"model_aliases.{key}"
+        aliases[key] = _parse_alias(apath, spec_raw)
 
-    targets: dict[str, TargetSpec] = {}
-    for tkey, tval in targets_raw.items():
-        tpath = f"targets.{tkey}"
-        # Lowercase slug-safe keys only: _profile_name() derives the registry and
-        # cache names from the key, so colliding spellings ("A B" vs "a-b") must
-        # be rejected here rather than silently clobber each other later.
-        if not isinstance(tkey, str) or not re.match(r"^[a-z0-9][a-z0-9._-]*$", tkey):
-            _err("targets", "keys must match ^[a-z0-9][a-z0-9._-]*$ (lowercase; no spaces)")
-        if not isinstance(tval, dict):
-            _err(tpath, f"expected a mapping, got {type(tval).__name__}")
-        _unknown(tpath, tval, {"provider", "aliases"})
-        provider = tval.get("provider")
-        if not isinstance(provider, str) or not provider.strip():
-            _err(f"{tpath}.provider", "required non-empty string")
-        aliases_raw = tval.get("aliases")
-        if not isinstance(aliases_raw, dict) or not aliases_raw:
-            _err(f"{tpath}.aliases", "required non-empty mapping")
-        aliases: dict[str, AliasSpec] = {}
-        for aname, aval in aliases_raw.items():
-            apath = f"{tpath}.aliases.{aname}"
-            if not isinstance(aname, str) or not aname.strip():
-                _err(f"{tpath}.aliases", "keys must be non-empty strings")
-            aliases[aname] = _parse_alias(apath, aval)
-        targets[tkey] = TargetSpec(key=tkey, provider=provider, aliases=aliases)
-
-    return AliasesConfig(strict=strict, debug=debug, refresh_seconds=refresh, targets=targets)
+    return AliasesConfig(
+        wrap_all=wrap_all,
+        strict=strict,
+        debug=debug,
+        refresh_seconds=refresh,
+        aliases=aliases,
+    )

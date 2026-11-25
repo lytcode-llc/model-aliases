@@ -1,4 +1,10 @@
-"""Alias matching, capability filtering, and latest-version selection (pure)."""
+"""Alias matching, capability filtering, and latest-version selection (pure).
+
+v2: the alias table is global — patterns match raw model ids (and each
+"/"-suffix segment of them, so aggregator ids like ``google/gemini-3-flash``
+also match ``gemini-*``). Resolution happens per-provider against that
+provider's candidates.
+"""
 
 from __future__ import annotations
 
@@ -43,12 +49,18 @@ def natural_key(s: str) -> tuple:
     return tuple(key)
 
 
-def _forms(c: Candidate, target_provider: str) -> tuple[str, ...]:
-    """Raw id and provider-prefixed id, so both 'glm-*' and 'openai/glm-*'
-    pattern styles work (and slash-containing aggregator ids match raw)."""
-    if target_provider:
-        return (c.id, f"{target_provider}/{c.id}")
-    return (c.id,)
+def _forms(c: Candidate, provider: str = "") -> tuple[str, ...]:
+    """Raw id, every "/"-suffix segment (aggregator ids), and the
+    provider-prefixed form when a provider is in play (v1-style patterns
+    like 'opencode-go/glm-*' keep working)."""
+    forms = [c.id]
+    if "/" in c.id:
+        parts = c.id.split("/")
+        for i in range(1, len(parts)):
+            forms.append("/".join(parts[i:]))
+    if provider:
+        forms.append(f"{provider}/{c.id}")
+    return tuple(forms)
 
 
 def _hits(forms: tuple[str, ...], patterns: tuple[str, ...]) -> bool:
@@ -59,11 +71,11 @@ def _hits(forms: tuple[str, ...], patterns: tuple[str, ...]) -> bool:
     )
 
 
-def candidate_matches(c: Candidate, spec: AliasSpec, target_provider: str) -> bool:
+def candidate_matches(c: Candidate, spec: AliasSpec, provider: str = "") -> bool:
     """Included by spec.match and not by spec.exclude (exclude always wins)."""
     if not spec.match:
         return False
-    forms = _forms(c, target_provider)
+    forms = _forms(c, provider)
     if spec.exclude and _hits(forms, spec.exclude):
         return False
     return _hits(forms, spec.match)
@@ -109,12 +121,7 @@ def _passes_filters(c: Candidate, spec: AliasSpec, now: date) -> bool:
 def select_latest(candidates: list[Candidate], spec: AliasSpec, *, now: date | None = None) -> str | None:
     """Best survivor: filters applied, then newest release_date first (undated
     sorts last), natural-version DESC and id DESC as tiebreaks. Candidates are
-    assumed pre-matched (see resolve_aliases).
-
-    Date-primary over version-primary so a same-version ``-preview`` released
-    before its base release loses to the base; a preview of a genuinely newer
-    version still wins on its later date. Undated candidates (live-only ids)
-    compare by version among themselves."""
+    assumed pre-matched (see resolve_aliases)."""
     today = now or date.today()
     survivors = [c for c in candidates if _passes_filters(c, spec, today)]
     if not survivors:
@@ -129,14 +136,15 @@ def select_latest(candidates: list[Candidate], spec: AliasSpec, *, now: date | N
 def resolve_aliases(
     aliases: dict[str, AliasSpec],
     candidates: list[Candidate],
-    target_provider: str,
     *,
     now: date | None = None,
+    provider: str = "",
 ) -> dict[str, str | None]:
-    """Resolve every alias independently; input order preserved; no match -> None."""
+    """Resolve every alias against ONE provider's candidates; input order
+    preserved; no match -> None."""
     out: dict[str, str | None] = {}
     for name, spec in aliases.items():
-        pool = [c for c in candidates if candidate_matches(c, spec, target_provider)]
+        pool = [c for c in candidates if candidate_matches(c, spec, provider)]
         out[name] = select_latest(pool, spec, now=now)
     return out
 

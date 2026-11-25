@@ -1,15 +1,17 @@
-"""Registration orchestration: config -> target descriptors -> resolve -> register.
+"""Registration orchestration: config -> referenced providers -> resolve -> wrap -> register.
 
 Called by the plugin root ``__init__.py`` at import (Hermes' loader contract:
-``register_provider()`` at import). Tolerant by default: a bad target or an
-unresolvable alias logs loudly and skips/degrades; ``model_aliases.strict``
-turns any of it into a load failure (nothing registered, Hermes logs the
-import error).
+``register_provider()`` at import). The flat alias table is resolved against
+each REFERENCED provider (model.provider, auxiliary.*.provider, fallback,
+delegation, smart routing, custom_providers entries — plus every registered
+provider when wrap_all is set), then each provider is wrapped: a profile under
+the real provider name carrying the alias table.
 
-Startup latency budget (Hermes' plugin load timeout is 10s): a warm cache
-(fresh + fully resolved) short-circuits with zero network; otherwise one
-shared models.dev fetch (serialized behind its memo lock) plus live ``/models``
-fetches run concurrently across targets.
+Tolerant by default: a provider that cannot be served or an alias with no
+match on it logs loudly; ``model_aliases.strict`` turns any of it into a load
+failure (nothing registered, Hermes logs the import error). Startup budget:
+eager resolution runs concurrently across providers behind one shared
+models.dev fetch — bounded well inside Hermes' 10s plugin load timeout.
 """
 
 from __future__ import annotations
@@ -31,20 +33,19 @@ from .catalog import (
     merge_candidates,
     models_dev_candidates,
 )
-from .config import AliasesConfig, ConfigError, TargetSpec, parse
+from .config import AliasesConfig, ConfigError, parse
+from .profile import build_custom_profile, wrap_profile
 from .resolver import resolve_aliases
 
 logger = logging.getLogger("model-aliases")
 
 _MODELS_DEV_MEMO: dict[str, Any] = {"ok": False, "catalog": None, "at": 0.0}
 _MODELS_DEV_LOCK = threading.Lock()
-# Failures are remembered briefly (so a cold loop doesn't refetch per target)
-# but never forever (a long-running process must recover when the net returns).
 _MEMO_FAILURE_RETRY_SECONDS = 60.0
 
 
 class TargetError(RuntimeError):
-    """A target cannot produce a usable profile."""
+    """A provider cannot be served (unknown, or an alias resolved to nothing)."""
 
 
 def _memo_models_dev() -> dict | None:
@@ -55,7 +56,7 @@ def _memo_models_dev() -> dict | None:
             return _MODELS_DEV_MEMO["catalog"]
         if age < _MEMO_FAILURE_RETRY_SECONDS and _MODELS_DEV_MEMO["at"] > 0.0:
             return None
-        _MODELS_DEV_MEMO["at"] = time.monotonic()  # attempt marker (prevents re-entry after failure)
+        _MODELS_DEV_MEMO["at"] = time.monotonic()
         catalog = fetch_models_dev()
         if isinstance(catalog, dict):
             _MODELS_DEV_MEMO.update(ok=True, catalog=catalog)
@@ -66,11 +67,7 @@ def _memo_models_dev() -> dict | None:
 def reset_models_dev_memo(catalog: dict | None = None) -> None:
     """Test seam: prime (catalog given) or clear the per-process memo."""
     with _MODELS_DEV_LOCK:
-        _MODELS_DEV_MEMO.update(
-            ok=catalog is not None,
-            catalog=catalog,
-            at=time.monotonic(),
-        )
+        _MODELS_DEV_MEMO.update(ok=catalog is not None, catalog=catalog, at=time.monotonic())
 
 
 def _load_raw_section() -> tuple[dict, dict]:
@@ -98,76 +95,82 @@ def _hermes_home() -> Path:
         return Path.home() / ".hermes"
 
 
-def _profile_name(target_key: str) -> str:
-    slug = re.sub(r"[^a-z0-9._-]+", "-", target_key.strip().lower()).strip("-")
-    return f"alias-{slug or 'target'}"
+def _cache_key(provider_name: str) -> str:
+    return re.sub(r"[^a-z0-9._-]+", "-", provider_name.strip().lower()).strip("-") or "default"
 
 
-def describe_target(provider_str: str, full_config: dict) -> tuple[ProviderDescriptor, dict[str, Any]]:
-    """Resolve a configured target provider string to a wire descriptor.
+# --- referenced-provider discovery -----------------------------------------
 
-    Order: named custom block in ``providers:`` / ``custom_providers:`` first
-    (handles ``custom:<name>`` and bare names), then the bundled provider
-    registry. Raises TargetError when the target cannot be served."""
-    ps = (provider_str or "").strip()
-    if not ps:
-        raise TargetError("empty target provider")
-    extras: dict[str, Any] = {
-        "api_mode": "",
-        "supports_vision": False,
-        "inline_api_key": None,
-        "warn": None,
-    }
-    blocks = full_config.get("providers") or full_config.get("custom_providers") or {}
-    bare = ps[7:] if ps.lower().startswith("custom:") else ps
-    block = blocks.get(bare) if isinstance(blocks, dict) else None
-    if isinstance(block, dict):
-        if block.get("enabled") is False:
-            raise TargetError(f"named custom provider {bare!r} is disabled (enabled: false)")
-        base = str(block.get("api") or block.get("base_url") or block.get("url") or "").strip()
-        if not base:
-            raise TargetError(f"providers.{bare} has no api/base_url")
-        key_env = str(block.get("key_env") or block.get("api_key_env") or "").strip()
-        inline = block.get("api_key")
-        extras["inline_api_key"] = inline.strip() if isinstance(inline, str) and inline.strip() else None
-        extras["api_mode"] = str(block.get("transport") or block.get("api_mode") or "")
-        if block.get("key_cmd"):
-            extras["warn"] = (
-                f"providers.{bare} uses key_cmd, which an alias profile cannot resolve; "
-                "set key_env or api_key"
-            )
-        desc = ProviderDescriptor(
-            name=ps,
-            base_url=base,
-            models_dev_id=str(block.get("catalog_provider") or "").strip(),
-            api_key_env=key_env,
-        )
-        return desc, extras
+def _add_referenced(store: dict[str, Any], provider: Any, entry: dict | None) -> None:
+    name = str(provider or "").strip()
+    if not name or name.lower() in {"auto", "none"}:
+        return
+    if name not in store:
+        store[name] = entry  # first mention wins; entry None = bundled
 
-    from providers import get_provider_profile
 
-    p = get_provider_profile(ps)
-    if p is None:
-        raise TargetError(f"unknown target provider {ps!r} (not bundled, not under providers:)")
-    if p.name.startswith("alias-"):
-        raise TargetError(f"target {ps!r} resolves to a model-aliases profile (self-reference)")
-    extras["api_mode"] = p.api_mode
-    extras["supports_vision"] = bool(p.supports_vision)
-    if p.auth_type != "api_key":
-        extras["warn"] = (
-            f"target {ps!r} uses auth_type={p.auth_type!r}; an alias profile only carries "
-            "api_key-style credentials, so inference may fail without an env key"
-        )
-    key_env = next((v for v in (p.env_vars or ()) if not str(v).endswith("_URL")), "")
-    desc = ProviderDescriptor(
-        name=ps,
-        base_url=p.base_url,
-        models_url=p.models_url,
-        models_dev_id=p.models_dev_id or "",
-        api_key_env=key_env,
-    )
-    return desc, extras
+def _custom_entry_for(name: str, full: dict) -> dict | None:
+    """A custom_providers list entry or providers: dict block for ``name``."""
+    bare = name[7:] if name.lower().startswith("custom:") else name
+    for block in (full.get("custom_providers"), full.get("providers")):
+        if isinstance(block, list):
+            for item in block:
+                if isinstance(item, dict) and str(item.get("name") or "").strip() == bare:
+                    return item
+        elif isinstance(block, dict):
+            item = block.get(bare)
+            if isinstance(item, dict) and ("api" in item or "base_url" in item or "url" in item):
+                return item
+    return None
 
+
+def referenced_providers(full: dict, cfg: AliasesConfig) -> dict[str, dict | None]:
+    """Every provider name referenced anywhere in config (-> custom entry or None).
+    When wrap_all is set, every registered provider joins the map."""
+    store: dict[str, Any] = {}
+
+    model_cfg = full.get("model") if isinstance(full.get("model"), dict) else {}
+    _add_referenced(store, model_cfg.get("provider"), _custom_entry_for(str(model_cfg.get("provider") or ""), full))
+
+    aux = full.get("auxiliary") if isinstance(full.get("auxiliary"), dict) else {}
+    for task, tcfg in aux.items():
+        if isinstance(tcfg, dict):
+            _add_referenced(store, tcfg.get("provider"), _custom_entry_for(str(tcfg.get("provider") or ""), full))
+
+    for fb in (full.get("fallback_providers") or []):
+        if isinstance(fb, dict):
+            _add_referenced(store, fb.get("provider"), _custom_entry_for(str(fb.get("provider") or ""), full))
+
+    deleg = full.get("delegation") if isinstance(full.get("delegation"), dict) else {}
+    _add_referenced(store, deleg.get("provider"), _custom_entry_for(str(deleg.get("provider") or ""), full))
+
+    smr = full.get("smart_model_routing") if isinstance(full.get("smart_model_routing"), dict) else {}
+    cheap = smr.get("cheap_model") if isinstance(smr.get("cheap_model"), dict) else {}
+    _add_referenced(store, cheap.get("provider"), _custom_entry_for(str(cheap.get("provider") or ""), full))
+
+    # custom_providers entries are wrapped even if no block references them yet
+    for block in (full.get("custom_providers"), full.get("providers")):
+        if isinstance(block, list):
+            for item in block:
+                if isinstance(item, dict) and item.get("name"):
+                    _add_referenced(store, str(item["name"]).strip(), item)
+        elif isinstance(block, dict):
+            for key, item in block.items():
+                if isinstance(item, dict) and ("api" in item or "base_url" in item):
+                    _add_referenced(store, key, item)
+
+    if cfg.wrap_all:
+        try:
+            from providers import list_providers
+
+            for prof in list_providers():
+                _add_referenced(store, prof.name, None)
+        except Exception:
+            logger.debug("model-aliases: list_providers failed for wrap_all", exc_info=True)
+    return store
+
+
+# --- per-provider resolution -------------------------------------------------
 
 def _md_key(desc: ProviderDescriptor, catalog: dict | None) -> str:
     if not isinstance(catalog, dict):
@@ -179,7 +182,6 @@ def _md_key(desc: ProviderDescriptor, catalog: dict | None) -> str:
 
 
 def _capability_meta(catalog: dict | None, key: str, resolved: dict[str, str]) -> dict[str, dict]:
-    """alias -> models.dev entry (models.dev shape), keyed for model_capabilities."""
     caps: dict[str, dict] = {}
     if not isinstance(catalog, dict) or not key:
         return caps
@@ -194,7 +196,6 @@ def _capability_meta(catalog: dict | None, key: str, resolved: dict[str, str]) -
 
 
 def _rid_meta(resolved: dict[str, str], caps: dict[str, dict]) -> dict[str, dict]:
-    """resolved-id -> entry, derived from alias-keyed capabilities."""
     out: dict[str, dict] = {}
     for alias, entry in caps.items():
         rid = resolved.get(alias)
@@ -203,119 +204,143 @@ def _rid_meta(resolved: dict[str, str], caps: dict[str, dict]) -> dict[str, dict
     return out
 
 
-def resolve_target(
+def describe_provider(name: str, entry: dict | None, full: dict) -> tuple[Any, ProviderDescriptor]:
+    """Resolve a referenced provider to (profile-to-wrap, wire descriptor).
+
+    Bundled: the registered profile itself (deepcopied by wrap_profile).
+    Custom entry: a freshly built profile from the entry fields."""
+    from providers import get_provider_profile
+
+    if entry is None:
+        prof = get_provider_profile(name)
+        if prof is None:
+            raise TargetError(f"unknown provider {name!r} (not bundled, not under custom_providers/providers:)")
+        desc = ProviderDescriptor(
+            name=name,
+            base_url=prof.base_url,
+            models_url=prof.models_url,
+            models_dev_id=prof.models_dev_id or "",
+            api_key_env=next((v for v in (prof.env_vars or ()) if not str(v).endswith("_URL")), ""),
+        )
+        return prof, desc
+    prof = build_custom_profile(name, entry)
+    if not prof.base_url:
+        raise TargetError(f"custom provider {name!r} has no api/base_url")
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    desc = ProviderDescriptor(
+        name=name,
+        base_url=prof.base_url,
+        models_dev_id=prof.models_dev_id,
+        api_key_env=key_env,
+    )
+    return prof, desc
+
+
+def resolve_provider(
     cfg: AliasesConfig,
-    spec: TargetSpec,
+    name: str,
     desc: ProviderDescriptor,
     cache_dir: Path,
-    profile_name: str,
     *,
     now: float | None = None,
     catalog: dict | None = None,
     force_live: bool = False,
     live_timeout: float = 3.0,
-) -> tuple[dict[str, str], dict, dict]:
-    """Resolve every alias for one target.
+) -> tuple[dict[str, str], dict, dict, list[str]]:
+    """Resolve the global alias table against ONE provider's candidates.
 
-    Returns (resolved alias->id restricted to configured aliases,
-    alias->models.dev entry, resolved-id->models.dev entry).
-
-    Warm short-circuit: when the cache is fresh (refresh_seconds) and already
-    resolves every configured alias, returns straight from disk with zero
-    network. Otherwise: models.dev candidates first (shared memo), live
-    /models only when stale/unresolved/forced. State merge keeps
-    last-known-good on failure and records drift; strict raises TargetError
-    on any alias left without a resolution."""
+    Returns (resolved, caps, rid_meta, real_ids). Warm cache (fresh +
+    complete) short-circuits with zero network; otherwise models.dev (shared
+    memo) + live /models. State keeps last-known-good on fetch failure and
+    records drift; strict raises on any alias left unresolved."""
     now = time.time() if now is None else now
-    prev = state.load(cache_dir, profile_name)
+    prev = state.load(cache_dir, _cache_key(name))
     stale = prev is None or (now - prev.updated_at) >= cfg.refresh_seconds
-    complete = prev is not None and all(a in prev.resolved for a in spec.aliases)
+    complete = prev is not None and all(a in prev.resolved for a in cfg.aliases)
 
     if not force_live and complete and not stale:
-        resolved = {a: prev.resolved[a] for a in spec.aliases}
+        resolved = {a: prev.resolved[a] for a in cfg.aliases}
         caps = {a: dict(m) for a, m in prev.capabilities.items() if a in resolved}
-        if cfg.debug:
-            logger.info("model-aliases: %s warm cache %s", spec.key, resolved)
-        return resolved, caps, _rid_meta(resolved, caps)
+        return resolved, caps, _rid_meta(resolved, caps), list(prev.real_ids)
 
     md = catalog if catalog is not None else _memo_models_dev()
     key = _md_key(desc, md)
     md_cands = models_dev_candidates(md, desc) if md else []
-    new_map = resolve_aliases(spec.aliases, md_cands, desc.name)
-    unresolved = [a for a in spec.aliases if not new_map.get(a)]
+    new_map = resolve_aliases(cfg.aliases, md_cands, provider=name)
+    unresolved = [a for a in cfg.aliases if not new_map.get(a)]
     live_rows = None
     if force_live or stale or unresolved:
         live_rows = fetch_live_ids(desc, timeout=live_timeout)
         if live_rows is not None:
             cands = merge_candidates(md_cands, live_rows)
-            new_map = resolve_aliases(spec.aliases, cands, desc.name)
+            new_map = resolve_aliases(cfg.aliases, cands, provider=name)
     merged, drift = state.merge(prev, new_map, now=now)
     for d in drift:
         when = _dt.datetime.fromtimestamp(d["at"]).isoformat(timespec="seconds")
         logger.warning(
             "model-aliases: %s/%s: %s -> %s (detected %s)",
-            profile_name, d["alias"], d["from"], d["to"], when,
+            name, d["alias"], d["from"], d["to"], when,
         )
-    resolved = {a: merged.resolved[a] for a in spec.aliases if a in merged.resolved}
+    resolved = {a: merged.resolved[a] for a in cfg.aliases if a in merged.resolved}
     caps = _capability_meta(md, key, resolved)
     if caps and caps != merged.capabilities:
         merged.capabilities = caps
-    changed = merged.resolved != (prev.resolved if prev else {})
+    real_ids = [c.id for c in (merge_candidates(md_cands, live_rows) if live_rows is not None else md_cands)]
+    if real_ids:
+        merged.real_ids = real_ids
+    changed = merged.resolved != (prev.resolved if prev else {}) or merged.real_ids != (prev.real_ids if prev else [])
     caps_changed = bool(caps) and caps != (prev.capabilities if prev else {})
     if prev is None or drift or changed or caps_changed or (live_rows is not None and stale):
-        state.save(cache_dir, profile_name, merged)
-    unresolved = [a for a in spec.aliases if a not in resolved]
+        state.save(cache_dir, _cache_key(name), merged)
+    unresolved = [a for a in cfg.aliases if a not in resolved]
     if unresolved:
         msg = (
-            f"target {spec.key!r}: alias(es) {', '.join(repr(u) for u in unresolved)} resolved "
-            "to no model (check match globs against the catalog)"
+            f"provider {name!r}: alias(es) {', '.join(repr(u) for u in unresolved)} matched "
+            "no models (check match globs against the catalog)"
         )
         if cfg.strict:
             raise TargetError(msg)
         logger.error("model-aliases: %s", msg)
     if cfg.debug:
-        logger.info("model-aliases: %s resolved %s", spec.key, resolved)
-    return resolved, caps, _rid_meta(resolved, caps)
+        logger.info("model-aliases: %s resolved %s", name, resolved)
+    return resolved, caps, _rid_meta(resolved, caps), real_ids
 
 
 def make_refresh(
     cfg: AliasesConfig,
-    spec: TargetSpec,
+    name: str,
     desc: ProviderDescriptor,
     cache_dir: Path,
-    profile_name: str,
     *,
     timeout: float = 8.0,
-) -> Callable[[float | None], tuple[dict[str, str], dict, dict] | None]:
-    """Closure for profile.fetch_models: force a live re-resolution and persist.
-    The profile passes its own fetch timeout through. Never raises."""
-    def refresh(live_timeout: float | None = None) -> tuple[dict[str, str], dict, dict] | None:
+) -> Callable[[float | None], tuple[dict, dict, dict, list] | None]:
+    """Closure for wrapped fetch_models: force a live re-resolution and persist.
+    Returns (resolved, caps, rid_meta, real_ids) or None on failure. Never raises."""
+    def refresh(live_timeout: float | None = None) -> tuple[dict, dict, dict, list] | None:
         try:
             budget = float(live_timeout) if live_timeout else timeout
-            return resolve_target(
-                cfg, spec, desc, cache_dir, profile_name,
+            return resolve_provider(
+                cfg, name, desc, cache_dir,
                 force_live=True, live_timeout=budget,
             )
         except Exception:
-            logger.debug("model-aliases: %s refresh failed", profile_name, exc_info=True)
+            logger.debug("model-aliases: %s refresh failed", name, exc_info=True)
             return None
     return refresh
 
 
 def _resolve_all(
     cfg: AliasesConfig,
-    prepped: list[tuple[TargetSpec, ProviderDescriptor, dict[str, Any], str]],
+    described: list[tuple[str, ProviderDescriptor]],
     cache_dir: Path,
     errors: list[str],
-) -> dict[int, tuple[dict[str, str], dict, dict]]:
-    """Resolve all prepared targets; live fetches overlap across targets
-    (the shared models.dev fetch serializes behind its memo lock)."""
-    results: dict[int, tuple[dict[str, str], dict, dict]] = {}
-    if len(prepped) > 1:
-        with ThreadPoolExecutor(max_workers=min(4, len(prepped))) as pool:
+) -> dict[int, tuple[dict, dict, dict, list]]:
+    results: dict[int, tuple[dict, dict, dict, list]] = {}
+    if len(described) > 1:
+        with ThreadPoolExecutor(max_workers=min(6, len(described))) as pool:
             futures = [
-                pool.submit(resolve_target, cfg, spec, desc, cache_dir, pname)
-                for spec, desc, _extras, pname in prepped
+                pool.submit(resolve_provider, cfg, name, desc, cache_dir)
+                for name, desc in described
             ]
             for i, fut in enumerate(futures):
                 try:
@@ -323,17 +348,17 @@ def _resolve_all(
                 except TargetError as e:
                     errors.append(str(e))
                 except Exception as e:
-                    errors.append(f"target {prepped[i][0].key!r}: {type(e).__name__}: {e}")
-                    logger.debug("model-aliases: target %s failed", prepped[i][0].key, exc_info=True)
+                    errors.append(f"provider {described[i][0]!r}: {type(e).__name__}: {e}")
+                    logger.debug("model-aliases: provider %s failed", described[i][0], exc_info=True)
         return results
-    for i, (spec, desc, _extras, pname) in enumerate(prepped):
+    for i, (name, desc) in enumerate(described):
         try:
-            results[i] = resolve_target(cfg, spec, desc, cache_dir, pname)
+            results[i] = resolve_provider(cfg, name, desc, cache_dir)
         except TargetError as e:
             errors.append(str(e))
         except Exception as e:
-            errors.append(f"target {spec.key!r}: {type(e).__name__}: {e}")
-            logger.debug("model-aliases: target %s failed", spec.key, exc_info=True)
+            errors.append(f"provider {name!r}: {type(e).__name__}: {e}")
+            logger.debug("model-aliases: provider %s failed", name, exc_info=True)
     return results
 
 
@@ -345,7 +370,7 @@ def register_all() -> None:
     except ConfigError as e:
         logger.error("model-aliases: invalid config: %s", e)
         return
-    if not cfg.targets:
+    if not cfg.aliases:
         return
     try:
         from providers import register_provider
@@ -353,44 +378,47 @@ def register_all() -> None:
         logger.error("model-aliases: provider registry unavailable: %s", e)
         return
 
-    from .profile import build_profile
-
     cache_dir = _hermes_home() / "cache" / "model-aliases"
     errors: list[str] = []
-    prepped: list[tuple[TargetSpec, ProviderDescriptor, dict[str, Any], str]] = []
-    for key, spec in cfg.targets.items():
+    described: list[tuple[str, ProviderDescriptor, Any, bool]] = []
+    for name, entry in referenced_providers(full, cfg).items():
         try:
-            desc, extras = describe_target(spec.provider, full)
-            prepped.append((spec, desc, extras, _profile_name(key)))
+            prof, desc = describe_provider(name, entry, full)
+            described.append((name, desc, prof, entry is not None))
         except TargetError as e:
             errors.append(str(e))
-        except Exception as e:  # one broken target must not take down the rest
-            errors.append(f"target {key!r}: {type(e).__name__}: {e}")
-            logger.debug("model-aliases: target %s failed", key, exc_info=True)
+        except Exception as e:
+            errors.append(f"provider {name!r}: {type(e).__name__}: {e}")
+            logger.debug("model-aliases: provider %s failed", name, exc_info=True)
 
-    results = _resolve_all(cfg, prepped, cache_dir, errors)
+    results = _resolve_all(cfg, [(n, d) for n, d, _p, _c in described], cache_dir, errors)
 
-    built: list[Any] = []
-    for i, (spec, desc, extras, pname) in enumerate(prepped):
+    wrapped: list[Any] = []
+    for i, (name, desc, prof, is_custom) in enumerate(described):
         if i not in results:
             continue
-        resolved, caps, rid_meta = results[i]
+        resolved, caps, rid_meta, real_ids = results[i]
         try:
-            built.append(
-                build_profile(
-                    profile_name=pname,
-                    spec=spec,
-                    desc=desc,
-                    extras=extras,
+            wrapped.append(
+                wrap_profile(
+                    prof,
+                    provider_name=name,
+                    aliases=cfg.aliases,
                     resolved=resolved,
-                    capability_meta=caps,
+                    caps=caps,
                     rid_meta=rid_meta,
-                    refresh=make_refresh(cfg, spec, desc, cache_dir, pname),
+                    real_ids=real_ids,
+                    refresh=make_refresh(cfg, name, desc, cache_dir),
+                    # Custom entries claim BOTH forms: the explicit custom:<name>
+                    # and the bare name. The generic 'custom' profile declares
+                    # bare-name aliases (ollama/local/vllm/...) that would
+                    # otherwise route lookup(name) away from this wrapper.
+                    extra_aliases=(f"custom:{name}", name) if is_custom else (),
                 )
             )
         except Exception as e:
-            errors.append(f"target {spec.key!r}: {type(e).__name__}: {e}")
-            logger.debug("model-aliases: build for %s failed", spec.key, exc_info=True)
+            errors.append(f"provider {name!r}: {type(e).__name__}: {e}")
+            logger.debug("model-aliases: wrap for %s failed", name, exc_info=True)
 
     if errors:
         joined = "model-aliases: " + "; ".join(errors)
@@ -399,7 +427,7 @@ def register_all() -> None:
             raise RuntimeError(joined)
         for e in errors:
             logger.error("model-aliases: %s", e)
-    for profile in built:
-        register_provider(profile)
+    for prof in wrapped:
+        register_provider(prof)
     if cfg.debug:
-        logger.info("model-aliases: registered %s", [p.name for p in built])
+        logger.info("model-aliases: registered %s", [p.name for p in wrapped])

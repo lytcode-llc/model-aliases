@@ -1,4 +1,4 @@
-"""resolver: matching, filters, latest selection, alias resolution."""
+"""resolver: v2 matching, filters, latest selection, alias resolution."""
 
 from __future__ import annotations
 
@@ -16,8 +16,6 @@ from model_aliases.resolver import (
     select_latest,
 )
 
-TP = "targetco"
-
 
 def _targetco(models_dev: dict) -> list[Candidate]:
     return [make_candidate(e) for e in models_dev["targetco"]["models"].values()]
@@ -34,12 +32,12 @@ def _spec(**kw) -> AliasSpec:
 
 # --- natural_key -----------------------------------------------------------
 
+
 def test_natural_key_orders_versions():
     assert natural_key("tcl-4.1") > natural_key("tcl-4.0") > natural_key("tcl-3.5") > natural_key("tcl-2.0")
 
 
 def test_natural_key_never_raises_on_mixed_input():
-    # mixed digit/non-digit shapes must stay comparable in both directions
     a, b = natural_key("gpt-4o"), natural_key("gpt-4.0")
     assert a != b and (a > b or a < b)
     assert natural_key("") <= natural_key("0")
@@ -47,33 +45,47 @@ def test_natural_key_never_raises_on_mixed_input():
 
 # --- candidate_matches -----------------------------------------------------
 
-def test_match_bare_and_prefixed_forms(models_dev):
+
+def test_match_bare_and_suffix_forms(models_dev):
     c = next(x for x in _targetco(models_dev) if x.id == "tcl-4.1")
     bare = _spec(match=("tcl-4*",))
+    assert candidate_matches(c, bare)
+    # Suffix-segment matching only helps on ids that contain '/' segments.
     prefixed = _spec(match=("targetco/tcl-4*",))
-    assert candidate_matches(c, bare, TP)
-    assert candidate_matches(c, prefixed, TP)
+    assert not candidate_matches(c, prefixed)
+
+
+def test_match_suffix_segments_for_aggregators(models_dev):
+    c = next(x for x in _aggco(models_dev) if x.id == "vendor/fast-2")
+    assert candidate_matches(c, _spec(match=("vendor/fast-*",)))
+    assert candidate_matches(c, _spec(match=("fast-*",)))
+    assert candidate_matches(c, _spec(match=("fast-2",)))
+    assert not candidate_matches(c, _spec(match=("vendor/*",), exclude=("*/fast-2",)))
+
+
+def test_match_multi_segment_suffixes():
+    c = Candidate(id="a/b/c")
+    assert candidate_matches(c, AliasSpec(match=("a/b/c",)))
+    assert candidate_matches(c, AliasSpec(match=("b/c",)))
+    assert candidate_matches(c, AliasSpec(match=("c",)))
+    assert not candidate_matches(c, AliasSpec(match=("a/c",)))
 
 
 def test_exclude_wins_over_match(models_dev):
     c = next(x for x in _targetco(models_dev) if x.id == "tcl-4.1-preview")
     keep = _spec(match=("tcl-4*",))
-    drop = _spec(match=("tcl-4*",), exclude=("targetco/*-preview",))
-    assert candidate_matches(c, keep, TP)
-    assert not candidate_matches(c, drop, TP)
+    drop = _spec(match=("tcl-4*",), exclude=("*-preview",))
+    assert candidate_matches(c, keep)
+    assert not candidate_matches(c, drop)
 
 
 def test_empty_match_never_matches(models_dev):
     c = _targetco(models_dev)[0]
-    assert not candidate_matches(c, _spec(match=()), TP)
-
-
-def test_slash_containing_aggregator_ids_match_raw(models_dev):
-    c = next(x for x in _aggco(models_dev) if x.id == "vendor/fast-2")
-    assert candidate_matches(c, _spec(match=("vendor/fast-*",)), "aggco")
+    assert not candidate_matches(c, _spec(match=()))
 
 
 # --- select_latest: ordering ----------------------------------------------
+
 
 def test_latest_picks_newest_release(models_dev):
     # date-primary: base tcl-4.1 (2026-02-10) beats its earlier preview (2026-02-01)
@@ -96,6 +108,7 @@ def test_no_survivors_returns_none(models_dev):
 
 # --- select_latest: filters ------------------------------------------------
 
+
 def test_min_context_boundary_inclusive(models_dev):
     # tcl-4.1 context == 400000 -> passes at 400000, fails above
     assert select_latest(_targetco(models_dev), _spec(min_context=400_000)) == "tcl-4.1"
@@ -108,7 +121,6 @@ def test_unknown_context_fails_min_context(models_dev):
 
 
 def test_tools_true_filters(models_dev):
-    # select_latest does not apply match (resolve_aliases pre-matches); pass a pre-matched pool
     pool = [c for c in _targetco(models_dev) if c.id == "tcl-4.1-preview"]
     assert select_latest(pool, _spec(tools=True)) is None
     assert select_latest(pool, _spec(tools=False)) == "tcl-4.1-preview"
@@ -151,6 +163,7 @@ def test_min_age_unknown_release_passes(models_dev):
 
 # --- resolve_aliases -------------------------------------------------------
 
+
 def test_resolve_multiple_aliases_independent(models_dev):
     cands = _targetco(models_dev)
     out = resolve_aliases(
@@ -160,7 +173,6 @@ def test_resolve_multiple_aliases_independent(models_dev):
             "nope": _spec(match=("nothing-*",)),
         },
         cands,
-        TP,
     )
     assert out["latest"] == "tcl-4.1"
     assert out["old"] == "tcl-2.0"
@@ -172,12 +184,12 @@ def test_resolve_with_filters_combined(models_dev):
     out = resolve_aliases(
         {"stable": _spec(match=("tcl-*",), exclude=("*-preview",), min_context=100_000, tools=True)},
         _targetco(models_dev),
-        TP,
     )
     assert out["stable"] == "tcl-4.1"
 
 
 # --- make_candidate --------------------------------------------------------
+
 
 def test_make_candidate_from_fixture_entry(models_dev):
     entry = models_dev["targetco"]["models"]["tcl-4.1"]
@@ -205,3 +217,20 @@ def test_make_candidate_rejects_bad_entries():
         make_candidate("not-a-dict")
     with pytest.raises(ValueError):
         make_candidate({})
+
+
+def test_provider_prefixed_pattern_matches():
+    """v1-style patterns (provider-prefixed) keep working when a provider is given."""
+    from model_aliases.config import AliasSpec
+    from model_aliases.resolver import Candidate, resolve_aliases
+
+    spec = AliasSpec(match=("opencode-go/glm-*",))
+    out = resolve_aliases(
+        {"glm-latest": spec},
+        [Candidate(id="glm-5.3", release_date="2026-01-01")],
+        provider="opencode-go",
+    )
+    assert out["glm-latest"] == "glm-5.3"
+    # without the provider form, the prefixed pattern must not match bare ids
+    out2 = resolve_aliases({"glm-latest": spec}, [Candidate(id="glm-5.3")])
+    assert out2["glm-latest"] is None

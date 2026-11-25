@@ -1,32 +1,41 @@
-# model_aliases block for ~/.hermes/config.yaml
+# model_aliases block for ~/.hermes/config.yaml (v2 flat schema)
 #
-# Port of the opencode-model-aliases aliases from opencode.jsonc: each alias
-# resolves to the newest matching model on the opencode-go provider at startup.
-# In Hermes the alias ids are scoped to the profile, so the OpenCode keys lose
-# their provider prefix: "opencode-go/glm-latest" -> "glm-latest".
+# A global alias table: declare once, use anywhere. Every provider your config
+# references gets the table automatically — the provider child-prop of each
+# block decides which catalog the alias resolves against:
 #
-# Usage after merging this into config.yaml:
-#   model:
-#     provider: alias-oc
-#     default: glm-latest
-# or switch in-session: /model alias-oc:glm-latest
+#   model:      { provider: opencode-go, default: glm-latest }   # real name + alias
+#   auxiliary.anything: { provider: opencode-go, model: glm-latest }
+#   fallback_providers: [{ provider: opencode-go, model: glm-latest }]
+#
+# There are no targets, no alias-* profiles, and no provider prefixes.
 
 model_aliases:
-  targets:
-    oc:
-      provider: opencode-go
-      aliases:
-        glm-latest:
-          match: ["opencode-go/glm-*"]
-        glm-flash-latest:
-          match: ["opencode-go/glm-*-flash"]
-        kimi-code-latest:
-          match: ["opencode-go/kimi-*-code"]
-        mimo-pro-latest:
-          match: ["opencode-go/mimo-*-pro"]
-        mimo-flash-latest:
-          match: ["opencode-go/mimo-*-flash"]
-        minimax-latest:
-          match: ["opencode-go/minimax-*"]
-        minimax-flash-latest:
-          match: ["opencode-go/minimax-*-flash"]
+  # wrap_all: true   # also wrap providers not referenced in config (eager, parallel)
+
+  glm-latest:
+    match: ["glm-*"]
+    exclude: ["*-preview"]        # never floats onto previews
+    # filter:
+    #   minContext: 128000
+    #   minAge: 48h                # skip models released < 48h ago
+    #   capabilities: { tools: true, input: [text] }
+    # select: { strategy: latest } # default; only strategy supported
+
+  gemini-flash-lite-latest:
+    match: ["gemini-*-flash-lite"]
+
+  kimi-code-latest:
+    match: ["kimi-*-code"]
+
+  mimo-pro-latest:
+    match: ["mimo-*-pro"]
+
+  mimo-flash-latest:
+    match: ["mimo-*-flash"]
+
+  minimax-latest:
+    match: ["minimax-*"]
+
+  minimax-flash-latest:
+    match: ["minimax-*-flash"]

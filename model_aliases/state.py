@@ -32,6 +32,7 @@ class Resolution:
     updated_at: float
     history: list[dict] = field(default_factory=list)
     capabilities: dict[str, dict] = field(default_factory=dict)
+    real_ids: list[str] = field(default_factory=list)
 
 
 def cache_path(cache_dir: Path, profile_name: str) -> Path:
@@ -55,6 +56,7 @@ def load(cache_dir: Path, profile_name: str) -> Resolution | None:
     updated_at = raw.get("updated_at")
     history = raw.get("history")
     capabilities = raw.get("capabilities", {})
+    real_ids = raw.get("real_ids")
     if not isinstance(resolved, dict):
         return None
     if not isinstance(updated_at, (int, float)) or isinstance(updated_at, bool):
@@ -63,12 +65,15 @@ def load(cache_dir: Path, profile_name: str) -> Resolution | None:
         return None
     if not isinstance(capabilities, dict):
         capabilities = {}
+    if not isinstance(real_ids, list):
+        real_ids = []
     caps = {str(k): dict(v) for k, v in capabilities.items() if isinstance(v, dict)}
     return Resolution(
         resolved={str(k): str(v) for k, v in resolved.items()},
         updated_at=float(updated_at),
         history=list(history),
         capabilities=caps,
+        real_ids=[str(x) for x in real_ids],
     )
 
 
@@ -84,6 +89,8 @@ def save(cache_dir: Path, profile_name: str, res: Resolution) -> None:
     }
     if res.capabilities:
         payload["capabilities"] = res.capabilities
+    if res.real_ids:
+        payload["real_ids"] = res.real_ids
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -125,5 +132,11 @@ def merge(
         caps = dict(prev.capabilities) if prev is not None else {}
     else:
         caps = {k: dict(v) for k, v in capabilities.items() if isinstance(v, dict)}
-    res = Resolution(resolved=merged, updated_at=now, history=history, capabilities=caps)
+    res = Resolution(
+        resolved=merged,
+        updated_at=now,
+        history=history,
+        capabilities=caps,
+        real_ids=list(prev.real_ids) if prev is not None else [],
+    )
     return res, events

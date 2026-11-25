@@ -16,8 +16,20 @@ from model_aliases.state import (
 )
 
 
-def _res(resolved: dict[str, str], updated_at: float = 1.0, history: list[dict] | None = None) -> Resolution:
-    return Resolution(resolved=resolved, updated_at=updated_at, history=history or [])
+def _res(
+    resolved: dict[str, str],
+    updated_at: float = 1.0,
+    history: list[dict] | None = None,
+    capabilities: dict[str, dict] | None = None,
+    real_ids: list[str] | None = None,
+) -> Resolution:
+    return Resolution(
+        resolved=resolved,
+        updated_at=updated_at,
+        history=history or [],
+        capabilities=capabilities or {},
+        real_ids=real_ids or [],
+    )
 
 
 # --- roundtrip / load failures -------------------------------------------
@@ -25,13 +37,28 @@ def _res(resolved: dict[str, str], updated_at: float = 1.0, history: list[dict] 
 
 def test_save_load_roundtrip(tmp_path: Path) -> None:
     history = [{"alias": "a", "from": None, "to": "m1", "at": 5.0}]
-    original = _res({"a": "m1", "b": "m2"}, updated_at=123.5, history=history)
+    original = _res(
+        {"a": "m1", "b": "m2"},
+        updated_at=123.5,
+        history=history,
+        capabilities={"a": {"limit": {"context": 128000}}},
+        real_ids=["m1", "m2"],
+    )
     save(tmp_path, "prof", original)
     loaded = load(tmp_path, "prof")
     assert loaded is not None
     assert loaded.resolved == original.resolved
     assert loaded.updated_at == 123.5
     assert loaded.history == history
+    assert loaded.capabilities == original.capabilities
+    assert loaded.real_ids == ["m1", "m2"]
+
+
+def test_load_missing_real_ids_defaults_empty(tmp_path: Path) -> None:
+    save(tmp_path, "prof", _res({"a": "m1"}, updated_at=1.0))
+    loaded = load(tmp_path, "prof")
+    assert loaded is not None
+    assert loaded.real_ids == []
 
 
 def test_load_missing_file(tmp_path: Path) -> None:
@@ -70,15 +97,23 @@ def test_load_wrong_shape(tmp_path: Path) -> None:
 
 def test_save_creates_nested_dirs_and_is_atomic(tmp_path: Path) -> None:
     cache_dir = tmp_path / "deep" / "nested"
-    save(cache_dir, "prof", _res({"a": "m1"}, updated_at=9.0))
+    save(cache_dir, "prof", _res({"a": "m1"}, updated_at=9.0, real_ids=["m1"]))
     path = cache_path(cache_dir, "prof")
     assert path.exists()
     # valid JSON on disk
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert on_disk["version"] == 1
     assert on_disk["resolved"] == {"a": "m1"}
+    assert on_disk["real_ids"] == ["m1"]
     # no temp file left behind
     assert not path.with_name(path.name + ".tmp").exists()
+
+
+def test_save_omits_empty_real_ids(tmp_path: Path) -> None:
+    save(tmp_path, "prof", _res({"a": "m1"}, updated_at=9.0))
+    path = cache_path(tmp_path, "prof")
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert "real_ids" not in on_disk
 
 
 # --- merge ----------------------------------------------------------------
@@ -120,6 +155,14 @@ def test_merge_prev_only_keys_retained() -> None:
     merged, events = merge(prev, {"keep": "m1"}, now=2.0)
     assert events == []
     assert merged.resolved == {"keep": "m1", "stale": "m2"}
+
+
+def test_merge_preserves_real_ids() -> None:
+    prev = Resolution(resolved={"a": "m1"}, updated_at=1.0, real_ids=["m1", "m2"])
+    merged, _events = merge(prev, {"a": "m1"}, now=2.0)
+    assert merged.real_ids == ["m1", "m2"]
+    fresh, _ = merge(None, {"a": "m1"}, now=3.0)
+    assert fresh.real_ids == []
 
 
 def test_merge_history_capped_at_20() -> None:
