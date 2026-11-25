@@ -572,34 +572,65 @@ def register_all() -> None:
     described = [(n, t["desc"], _union_scope(t)) for n, t in targets.items()]
     results = _resolve_all(cfg, described, cache_dir, errors)
 
-    # --- wrap each target once, claimed under every name that needs it ---
+    # --- wrap each target: one wrap per GROUP (primary name = the group key)
+    # plus a target-name wrap (picker + real-name consumers) ---
+    # resolve_provider canonicalizes provider aliases to the profile's NAME, so
+    # the group wrap's primary name must BE the group key: canonicalizing to an
+    # early-return family name (the target) would hand agent-init a name whose
+    # normalization never consults the profile — the whole point of developer
+    # naming is that the canonical name dodges those families.
     wrapped: list[Any] = []
+    seen: set[str] = set()
     for i, (name, t) in enumerate(targets.items()):
         if i not in results:
             continue
         resolved, caps, rid_meta, real_ids = results[i]
         alias_map = _union_scope(t)
-        extra: list[str] = []
-        extra.extend(t["groups"].keys())  # developer-named provider aliases
-        if t["is_custom"]:
-            extra.append(f"custom:{name}")
-        try:
-            wrapped.append(
-                wrap_profile(
-                    t["prof"],
-                    provider_name=name,
-                    aliases=alias_map,
-                    resolved=resolved,
-                    caps=caps,
-                    rid_meta=rid_meta,
-                    real_ids=real_ids,
-                    refresh=make_refresh(cfg, name, t["desc"], cache_dir, alias_map),
-                    extra_aliases=tuple(dict.fromkeys(extra)),
+        refresh = make_refresh(cfg, name, t["desc"], cache_dir, alias_map)
+
+        for gname in t["groups"].keys():
+            if gname in seen:
+                continue
+            seen.add(gname)
+            extra = (f"custom:{gname}",) if (t["is_custom"] and gname == name) else ()
+            try:
+                wrapped.append(
+                    wrap_profile(
+                        t["prof"],
+                        provider_name=gname,
+                        aliases=alias_map,
+                        resolved=resolved,
+                        caps=caps,
+                        rid_meta=rid_meta,
+                        real_ids=real_ids,
+                        refresh=refresh,
+                        extra_aliases=extra,
+                    )
                 )
-            )
-        except Exception as e:
-            errors.append(f"provider {name!r}: {type(e).__name__}: {e}")
-            logger.debug("model-aliases: wrap for %s failed", name, exc_info=True)
+            except Exception as e:
+                errors.append(f"provider alias {gname!r}: {type(e).__name__}: {e}")
+                logger.debug("model-aliases: group wrap for %s failed", gname, exc_info=True)
+
+        if name not in seen:
+            seen.add(name)
+            extra = (f"custom:{name}",) if t["is_custom"] else ()
+            try:
+                wrapped.append(
+                    wrap_profile(
+                        t["prof"],
+                        provider_name=name,
+                        aliases=alias_map,
+                        resolved=resolved,
+                        caps=caps,
+                        rid_meta=rid_meta,
+                        real_ids=real_ids,
+                        refresh=refresh,
+                        extra_aliases=extra,
+                    )
+                )
+            except Exception as e:
+                errors.append(f"provider {name!r}: {type(e).__name__}: {e}")
+                logger.debug("model-aliases: wrap for %s failed", name, exc_info=True)
 
     # --- custom entries whose model/default_model is a known alias: validate ---
     for idx, (name, t) in enumerate(targets.items()):

@@ -423,11 +423,18 @@ def test_register_all_registers_group_wrapped_under_target_and_group_names(
 
     _run_register_all(monkeypatch, tmp_path, _cfg_raw_groups())
 
-    assert [p.name for p in stub_providers] == ["opencode-go"]
-    p = stub_providers[0]
-    assert p.normalize_model_id("fast") == "tcl-4.1"
-    assert "fast" in p.fetch_models()
-    assert "ocg-alias" in p.aliases
+    # Two wraps share the target's resolution state: the GROUP wrap (primary
+    # name = the group key — resolve_provider canonicalizes aliases to the
+    # profile NAME, which must dodge the early-return families) and the
+    # target-name wrap (picker + real-name consumers).
+    assert [p.name for p in stub_providers] == ["ocg-alias", "opencode-go"]
+    group_wrap = next(p for p in stub_providers if p.name == "ocg-alias")
+    target_wrap = next(p for p in stub_providers if p.name == "opencode-go")
+    for p in (group_wrap, target_wrap):
+        assert p.normalize_model_id("fast") == "tcl-4.1"
+        assert "fast" in p.fetch_models()
+    # The group name is the wrap's PRIMARY name, not an alias claim on the target.
+    assert "ocg-alias" not in target_wrap.aliases
 
 
 def test_register_all_custom_entry_extra_alias(tmp_path, monkeypatch, stub_providers, models_dev):
