@@ -321,3 +321,39 @@ def test_register_all_config_error_registers_nothing(tmp_path, monkeypatch, stub
 def test_register_all_empty_config_is_noop(tmp_path, monkeypatch, stub_providers):
     _run_register_all(monkeypatch, tmp_path, {})
     assert stub_providers == []
+
+
+def test_wrapped_profile_answers_to_alias_provider_name(tmp_path, monkeypatch, stub_providers, models_dev):
+    """Early-return families (opencode/aggregators/dot-hyphen) need the
+    neutral alias-<provider> name on the request path."""
+    monkeypatch.setattr(plugin_mod, "_memo_models_dev", lambda: models_dev)
+    monkeypatch.setattr(plugin_mod, "fetch_live_ids", lambda desc, timeout=3.0: None)
+    _run_register_all(monkeypatch, tmp_path, _cfg_raw(), _custom_full())
+    p = stub_providers[0]
+    assert "alias-local" in p.aliases, p.aliases
+    # bare name + custom: form for custom entries
+    assert "local" in p.aliases
+    assert "custom:local" in p.aliases
+
+
+def test_alias_provider_reference_resolves_back_for_wrapping(tmp_path, monkeypatch, stub_providers, models_dev):
+    """model.provider: alias-<x> must wrap <x> (the neutral name is an alias
+    OF the real wrap — describing it directly would miss)."""
+    monkeypatch.setattr(plugin_mod, "_memo_models_dev", lambda: models_dev)
+    monkeypatch.setattr(plugin_mod, "fetch_live_ids", lambda desc, timeout=3.0: None)
+    pkg = sys.modules["providers"]
+    fake = types.SimpleNamespace(
+        name="opencode-go", api_mode="chat_completions", supports_vision=False,
+        auth_type="api_key", env_vars=("OPENCODE_GO_API_KEY",),
+        base_url="https://api.opencode.ai/v1", models_url="", models_dev_id="targetco",
+    )
+    pkg.get_provider_profile = lambda name: fake if name == "opencode-go" else None
+    raw = {"glm-latest": {"match": ["glm-*"]}}
+    full = {"model": {"provider": "alias-opencode-go"}}
+    _run_register_all(monkeypatch, tmp_path, raw, full)
+    assert [p.name for p in stub_providers] == ["opencode-go"], stub_providers
+    p = stub_providers[0]
+    assert "alias-opencode-go" in p.aliases
+    # glm-* matches nothing in the targetco fixture — unresolved alias stays
+    # literal (the registration + neutral name are what this test proves)
+    assert p.normalize_model_id("glm-latest") is None

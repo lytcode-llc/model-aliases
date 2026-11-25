@@ -1,48 +1,150 @@
 # model-aliases
 
-Floating model aliases for Hermes. You configure a stable id once (`fast`, `stable`),
-and the plugin resolves it to the newest model your provider actually offers, every
-time Hermes starts. When the provider ships a newer release, the alias follows it
-without you editing anything.
+Floating model aliases for Hermes.
 
-The alias semantics (match / exclude / capability filters, `latest` selection,
-strict and tolerant failure policies) are ported from the
+You declare a stable model id once (`glm-latest`) and the plugin resolves it to the
+newest matching model your provider actually offers, every time Hermes starts. When
+the provider ships a newer release, the alias follows it. No config edits.
+
+The alias semantics (match / exclude / capability filters, `latest` selection, strict
+and tolerant failure policies) are ported from the
 [`opencode-model-aliases`](https://www.npmjs.com/package/opencode-model-aliases)
 plugin for OpenCode.
 
+## Contents
+
+- [What it is](#what-it-is)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Configuration reference](#configuration-reference)
+- [First 5 minutes](#first-5-minutes)
+- [Support matrix](#support-matrix)
+- [Troubleshooting](#troubleshooting)
+- [Cache and drift](#cache-and-drift)
+- [Failure policy](#failure-policy)
+- [Limitations](#limitations)
+- [Development](#development)
+- [Contributing](#contributing)
+- [License](#license)
+
+## What it is
+
+- One flat, global alias table in `~/.hermes/config.yaml`, under `model_aliases:`.
+- Aliases are not bound to a provider. The same slug resolves against each provider's
+  own catalog, so it means "the newest matching model this provider serves".
+- The plugin wraps the providers your config already references, so an alias id works
+  wherever a (provider, model) pair appears: main model, auxiliary tasks, fallbacks,
+  the `/model` picker, delegation.
+- Standard library only. No third-party dependencies to install.
+
+There is no `targets:` block, no `alias-*` profile, and no provider prefix in the
+schema. One table, declared once, used everywhere.
+
 ## How it works
 
-Hermes translates every model id through one seam,
-`normalize_model_for_provider()` (`hermes_cli/model_normalize.py`), and asks the
-active provider profile's `normalize_model_id()` first. This plugin registers one
-provider profile per configured target (named `alias-<target key>`) whose
-`normalize_model_id()` maps an alias to the newest matching concrete model id.
+### 1. Provider wrapping
 
-Concretely:
+Hermes translates every model id through one seam, `normalize_model_for_provider()`
+(`hermes_cli/model_normalize.py`), and asks the active provider profile's
+`normalize_model_id()` first. This plugin makes the real provider answer that call.
 
-1. You write `model_aliases:` in `~/.hermes/config.yaml` and point `model.provider`
-   at the alias profile.
-2. At plugin load (import time), the plugin resolves every alias against the
-   models.dev catalog and, when needed, the target's live `/models` endpoint.
-3. `normalize_model_id("fast")` returns the resolved id at agent init, on `/model`
-   switches, for auxiliary tasks (`auxiliary.<task>`), and for fallback providers.
-4. `/model` lists the alias ids themselves, which never go stale, and the metadata
-   attached to an alias (context window, capability flags) comes from the resolved
-   model's models.dev entry.
+At import (Hermes' loader contract: `register_provider()` at import time), the plugin
+scans the config for every referenced provider:
 
-Concrete model ids are left alone: `normalize_model_id()` returns `None` for
-anything that is not an alias, so Hermes' generic normalization handles them
-unchanged. If a profile hook ever raised, Hermes would fall back to its generic
-rules rather than break the request.
+- `model.provider`
+- `auxiliary.<task>.provider`
+- `fallback_providers[].provider`
+- `delegation.provider`
+- `smart_model_routing.cheap_model.provider`
+- every entry of `custom_providers:` (list form) and `providers:` (dict form)
+
+For each one, it registers a profile **under the real provider name**. The profile is
+a deep copy of the original with three methods shadowed on the instance:
+
+| Method | What the wrapper does |
+| --- | --- |
+| `normalize_model_id()` | Maps an alias to the resolved concrete id. Pure dict lookup, no I/O. Returns `None` for real ids, so Hermes' generic normalization handles them unchanged. |
+| `fetch_models()` | Returns the provider's real model ids plus the alias ids, for the `/model` picker. Forces a live re-resolution first, and a failed refresh keeps the current snapshot. |
+| `live_context_length()` | Returns the context window of the resolved target model. |
+
+Because the profile keeps the real provider name, credential pools, `auth_type`, env
+var ladders and registry sync keep working unchanged. Hermes sees the same provider it
+saw before, with an alias table attached.
+
+### 2. Per-provider resolution
+
+Every provider is resolved on its own, against its own catalog:
+
+1. **models.dev** (`https://models.dev/api.json`) is the primary catalog. It supplies
+   release dates, context windows, tool support and modalities. One fetch per process,
+   shared by all providers; a failed fetch is retried after 60 seconds.
+2. **The provider's live `/models` endpoint** (`<base_url>/models`, or the provider's
+   own `models_url`) is fetched when the cache is stale, when an alias is still
+   unresolved, or when the picker forces a refresh. It is required for endpoints that
+   are not on models.dev. The request carries the provider's `Authorization: Bearer`
+   header when the provider exposes a key env var, and a descriptive `User-Agent`
+   (models.dev and several provider endpoints reject the stock Python-urllib agent).
+   The live fetch times out after 3 seconds at startup, and after 8 seconds when the
+   picker forces a refresh.
+
+Both sources merge by id, and models.dev entries win, because they carry the full
+metadata. Live-only ids contribute a thin candidate (id plus context window, if the
+endpoint reports one).
+
+Resolution is per provider, so the same slug can resolve to different ids on different
+providers: `glm-latest` resolves against whatever catalog the provider in play
+actually serves.
+
+### 3. Matching
+
+A candidate matches when any of these forms matches any `match` pattern, and no
+`exclude` pattern matches any of them:
+
+| Form | Example |
+| --- | --- |
+| The raw model id | `glm-4.7` |
+| Every `/`-suffix segment of it | `google/gemini-3-flash` also matches `gemini-*` |
+| The provider-prefixed form, when a provider is in play | `opencode-go/glm-4.7` |
+
+So `match: ["glm-*"]` catches `glm-4.7`, `z-ai/glm-4.7` and `opencode-go/glm-4.7`
+alike, on every provider. A provider-prefixed pattern (`opencode-go/glm-*`) matches
+the provider-prefixed form, so it keeps working for that provider while the bare
+form would have matched it too. Patterns are shell globs (`fnmatch` syntax): `*`,
+`?`, `[seq]`. An empty `match` never matches.
+
+### 4. Filtering and selection
+
+After matching, a candidate must pass every configured filter:
+
+| Filter | Passes when | Unknown metadata |
+| --- | --- | --- |
+| `filter.minContext` | `context >= minContext` | Fails (an unknown context cannot be verified) |
+| `filter.capabilities.tools` | `tool_call == the requested value` | Fails |
+| `filter.capabilities.input` / `output` | every requested modality is present | Fails |
+| `filter.minAge` | released on or before the cutoff | Passes (no evidence of recency) |
+
+Boundaries are inclusive: a model with exactly `minContext` tokens passes, and a model
+released exactly at the `minAge` cutoff passes.
+
+**Selection.** Survivors are ranked by newest `release_date` first (undated ids sort
+last), then by a natural version key descending (`glm-4.7` > `glm-4.6` > `glm-4`), then
+by id descending. Date is primary so a same-version `-preview` released before its
+base release loses to the base, while a preview of a genuinely newer version still
+wins on its later date.
+
+**Alias independence.** Every alias is resolved on its own against the same candidate
+pool. An alias that matches nothing resolves to nothing and does not affect the
+others.
 
 ## Requirements
 
-- Hermes installed and importable (`hermes_cli`, `providers`, `hermes_constants`).
-  The plugin is loaded by Hermes' own plugin loader.
+- Hermes installed and importable (`hermes_cli`, `providers`, `hermes_constants`). The
+  plugin is loaded by Hermes' own plugin loader.
 - Python 3.11 (the interpreter in Hermes' virtualenv). The plugin uses only the
   standard library, so there are no third-party dependencies to install.
-- Network access to `https://models.dev/api.json` and to the target provider's
-  `/models` endpoint, for cold starts. A warm cache needs no network at all.
+- Network access to `https://models.dev/api.json` and to each provider's `/models`
+  endpoint, for cold starts. A warm cache needs no network at all.
 - Write access to `$HERMES_HOME/cache/model-aliases/` (`~/.hermes/cache/model-aliases/`
   by default) for the resolution cache.
 
@@ -53,8 +155,8 @@ mkdir -p ~/.hermes/plugins/model-providers
 git clone <this-repo> ~/.hermes/plugins/model-providers/model-aliases
 ```
 
-or, for development, symlink the working copy (run this **from the repo
-directory** — `$PWD` must be the repo, not your home folder):
+or, for development, symlink the working copy (run this **from the repo directory**,
+`$PWD` must be the repo, not your home folder):
 
 ```bash
 mkdir -p ~/.hermes/plugins/model-providers
@@ -63,144 +165,53 @@ ln -s "$PWD" ~/.hermes/plugins/model-providers/model-aliases
 
 Hermes discovers user plugins under `$HERMES_HOME/plugins/`, and a
 `model-providers/<name>/` directory is loaded as a model-provider plugin.
-Registration happens at import of the repository root `__init__.py`, so the
-profile exists as soon as the plugin is loaded. Restart Hermes after installing
-or after editing the config: the `model_aliases:` section is read at import.
-
-## First 5 minutes
-
-**1. Add the config.** Edit `~/.hermes/config.yaml`:
-
-```yaml
-model_aliases:
-  debug: true
-  targets:
-    oc:
-      provider: opencode-go
-      aliases:
-        fast:
-          match: ["glm-*"]
-          exclude: ["*-preview"]
-          filter:
-            minContext: 128000
-            capabilities:
-              tools: true
-        stable:
-          match: ["glm-4.7*"]
-
-model:
-  provider: alias-oc
-  default: fast
-```
-
-`model.provider: alias-oc` selects the alias profile (the profile name is
-`alias-` plus the target key), and `model.default: fast` is the alias you want
-to run.
-
-**2. Restart Hermes.** The plugin reads the config at import.
-
-**3. Check that the profile is live.**
-
-```bash
-hermes doctor
-```
-
-Doctor probes the alias profile like any other api-key provider: it requests the
-target's `/models` endpoint with the key from the target's env var and prints a
-row labelled `Aliases (opencode-go)`. The row only appears when the target
-exposes a key env var (`key_env` on a named provider block, the provider's own
-env var for a bundled target). Doctor reads env vars only, so a key supplied
-inline as `api_key` is used at runtime but shows as not configured in doctor.
-
-With `debug: true`, the plugin logs the resolution it performed:
-
-```
-model-aliases: oc resolved {'fast': 'glm-4.7', 'stable': 'glm-4.7'}
-model-aliases: registered ['alias-oc']
-```
-
-**4. Use it.** The alias works everywhere a model id is accepted:
-
-```yaml
-model:
-  provider: alias-oc
-  default: fast            # floats forever
-
-auxiliary:
-  summarizer:
-    provider: alias-oc     # auxiliary calls normalize through the same seam
-    model: stable
-
-fallback_providers:
-  - provider: alias-oc
-    model: fast
-```
-
-In a session, `/model` shows the alias ids (`fast`, `stable`) for the alias
-profile, not the concrete ids behind them.
-
-**5. When the provider ships a new release.** The next startup re-resolves and
-the alias moves with it. When the winner changes, the plugin logs one drift line:
-
-```
-model-aliases: alias-oc/fast: glm-4.6 -> glm-4.7 (detected 2026-11-23T09:14:22)
-```
-
-The drift is also recorded in the cache file (see
-[Inspecting drift and the cache](#inspecting-drift-and-the-cache)).
+Registration happens at import of the repository root `__init__.py`, so the wrapped
+providers exist as soon as the plugin is loaded. Restart Hermes after installing or
+after editing the config: the `model_aliases:` section is read at import.
 
 ## Configuration reference
 
-Everything lives under the `model_aliases:` key in `~/.hermes/config.yaml`.
-Unknown keys are rejected with the offending path in the message, so a typo
-fails loudly at startup instead of being ignored. Edit the file directly:
-`hermes config set` does not know this section and warns about unrecognized
-keys.
+Everything lives under the `model_aliases:` key in `~/.hermes/config.yaml`. Edit the
+file directly: `hermes config set` does not know this section and warns about
+unrecognized keys.
 
 ```yaml
 model_aliases:
-  strict: false          # true: fail the plugin load instead of degrading
-  debug: false           # log every resolution
-  refresh_seconds: 3600  # how long a cached resolution is trusted
+  wrap_all: false       # true: also wrap providers the config does not reference
+  strict: false         # true: fail the plugin load instead of degrading
+  debug: false          # log every resolution
+  refresh_seconds: 3600 # how long a cached resolution is trusted
 
-  targets:
-    oc:                          # key must match ^[a-z0-9][a-z0-9._-]*$
-      provider: opencode-go      # bundled provider name, or a providers: block
-      aliases:
-        fast:
-          match: ["glm-*"]             # required; glob against the model id
-          exclude: ["*-preview"]       # optional; exclude always wins
-          filter:
-            minContext: 128000         # required context window
-            minAge: 48h                # '<n>h' or '<n>d'
-            capabilities:
-              tools: true              # required tool support
-              input: [text, image]     # every listed modality must be present
-              output: [text]
-          select:
-            strategy: latest           # only 'latest' is supported
+  glm-latest:
+    match: ["glm-*"]            # required; glob against the model id
+    exclude: ["*-preview"]      # optional; exclude always wins
+    filter:
+      minContext: 128000        # required context window
+      minAge: 48h               # '<n>h' or '<n>d'
+      capabilities:
+        tools: true             # required tool support
+        input: [text, image]    # every listed modality must be present
+        output: [text]
+    select:
+      strategy: latest          # only 'latest' is supported
 ```
+
+A ready-to-paste block is in [`examples/hermes-config.yaml`](examples/hermes-config.yaml).
 
 ### Top-level keys
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
+| `wrap_all` | boolean | `false` | Also wrap every registered provider, not only the referenced ones. |
 | `strict` | boolean | `false` | Turn any resolution failure into a plugin load failure. |
-| `debug` | boolean | `false` | Log each resolution, and each warm-cache hit. |
+| `debug` | boolean | `false` | Log each resolution and the list of registered providers. |
 | `refresh_seconds` | positive integer | `3600` | Age at which a cached resolution is considered stale. |
 
-### `targets.<key>`
+Every other top-level key is an alias slug. Unknown keys inside an alias spec are
+rejected with the offending key path in the message, so a typo is logged at load and
+skips registration instead of being ignored.
 
-| Key | Type | Required | Meaning |
-| --- | --- | --- | --- |
-| `provider` | non-empty string | yes | The provider to alias. A bundled Hermes provider name, or the name of a block under `providers:` (with or without the `custom:` prefix). |
-| `aliases` | mapping | yes | At least one alias. The keys are the alias ids you will use. |
-
-Target keys must match `^[a-z0-9][a-z0-9._-]*$` (lowercase, no spaces). The key
-becomes the profile name: target `oc` registers the profile `alias-oc`, which you
-then use as `model.provider`.
-
-### `targets.<key>.aliases.<alias>`
+### `<alias>`
 
 | Key | Type | Required | Meaning |
 | --- | --- | --- | --- |
@@ -213,23 +224,44 @@ then use as `model.provider`.
 | `filter.capabilities.output` | string or list of strings | no | Required output modalities. |
 | `select.strategy` | string | no | Must be `latest` if present. |
 
-Pattern lists must not be empty, and every item must be a non-empty string.
-`select` may be omitted; `latest` is the only strategy implemented.
+Pattern lists must not be empty, and every item must be a non-empty string. `select`
+may be omitted; `latest` is the only strategy implemented.
 
-### Provider-side keys
+Alias lookup is case-insensitive: `normalize_model_id("GLM-LATEST")` resolves the same
+as `glm-latest`.
 
-For a target that names a block under `providers:` (a custom or local endpoint),
-the plugin reads these keys from that block:
+### `wrap_all`
+
+`false` (default): wrap only the providers the config references. That keeps the
+number of live catalog fetches small and the startup inside Hermes' 10 second plugin
+load budget (`plugins.load_timeout_seconds`).
+
+`true`: wrap every registered provider too, including ones the config never mentions.
+
+Both modes resolve eagerly at import. There is no lazy path: `normalize_model_id()`
+has to stay free of I/O, so the resolution happens once, at load, behind one shared
+models.dev fetch, with the per-provider fetches running concurrently. The result is
+held in memory for the life of the process.
+
+### Custom providers
+
+Entries in `custom_providers:` (list form) or `providers:` (dict form) are wrapped
+like bundled providers. The plugin reads these keys from the block:
 
 | Key | Meaning |
 | --- | --- |
-| `api`, `base_url` or `url` | The endpoint. One of them is required for a named block. |
+| `name` | The provider name. Required in the list form. |
+| `api`, `base_url` or `url` | The endpoint. One of them is required. |
 | `key_env` or `api_key_env` | Env var holding the bearer token. Used for the live `/models` fetch and as the profile's credential env var. |
-| `api_key` | Inline key, served through the profile's credential hook. Not visible to `hermes doctor`, which reads env vars only. |
-| `transport` or `api_mode` | Wire protocol: `chat_completions` (default), `anthropic_messages`, `codex_responses`, `bedrock_converse`. Hermes' own `openai_chat` is accepted as the equivalent of `chat_completions`. |
+| `transport` or `api_mode` | Wire protocol. `chat_completions` when unset. |
 | `catalog_provider` | The models.dev provider id to read this endpoint's models from. |
-| `enabled: false` | The target is refused at load with an error. |
-| `key_cmd` | Not supported. The plugin warns and cannot fetch the live catalog for this target. |
+
+A custom entry claims two profile names: `custom:<name>` and the bare `<name>`. The
+bare name matters because Hermes' generic `custom` profile declares bare-name aliases
+(`ollama`, `local`, `vllm`) that would otherwise intercept the lookup.
+
+The plugin reads only the keys above, to build the wrapped profile and to fetch the
+live catalog. Every other key of a provider block stays Hermes' business.
 
 ```yaml
 providers:
@@ -240,229 +272,279 @@ providers:
     catalog_provider: ollama
 
 model_aliases:
-  targets:
-    local:
-      provider: custom:local
-      aliases:
-        fast:
-          match: ["llama*"]
+  fast:
+    match: ["llama*"]
+
+model:
+  provider: local
+  default: fast
 ```
 
-Notes on named blocks:
+## First 5 minutes
 
-- The block must live in the `providers:` mapping. Hermes' legacy list-form
-  `custom_providers:` is not read by this plugin.
-- The plugin reads `providers:` first and only falls back to `custom_providers:`
-  when `providers:` is absent or empty.
-- A bare name that matches a `providers:` block uses that block; otherwise the
-  name is looked up in the bundled provider registry.
-- A target that resolves to another alias profile is refused (self-reference).
+**1. Add the config.** Edit `~/.hermes/config.yaml`:
 
-## Matching and selection
+```yaml
+model_aliases:
+  debug: true
+  glm-latest:
+    match: ["glm-*"]
+    exclude: ["*-preview"]
+    filter:
+      minContext: 128000
+      capabilities:
+        tools: true
 
-**Matching.** A candidate matches when its raw model id (`glm-4.7`) or its
-provider-prefixed id (the configured provider string plus the id, for example
-`opencode-go/glm-4.7`) matches any `match` pattern, and no `exclude` pattern
-matches either form. Patterns are shell globs
-(`fnmatch` syntax): `*`, `?`, `[seq]`. Aggregator ids that contain a slash
-(`vendor/fast-1`) match raw patterns too. An empty `match` never matches.
+model:
+  provider: opencode-go
+  default: glm-latest
+```
 
-**Filtering.** After matching, a candidate must pass every configured filter:
+`model.provider` stays the real provider name; the plugin wraps that provider, it does
+not replace it. `model.default` is the alias you want to run.
 
-| Filter | Passes when | Unknown metadata |
+**2. Restart Hermes.** The config is read at plugin import.
+
+**3. Check the resolution.** With `debug: true` the plugin logs what it resolved and
+what it registered:
+
+```
+model-aliases: opencode-go resolved {'glm-latest': 'glm-5.3-flash'}
+model-aliases: registered ['opencode-go']
+```
+
+**4. Use it.** The alias works anywhere a model id is accepted:
+
+```yaml
+model:
+  provider: opencode-go
+  default: glm-latest
+
+auxiliary:
+  summarizer:
+    provider: opencode-go
+    model: glm-latest
+
+fallback_providers:
+  - provider: opencode-go
+    model: glm-latest
+```
+
+In a session, `/model` shows the provider's real model ids and the alias ids.
+
+`opencode-go` is one of the provider families whose generic normalization returns before
+it asks the provider profile, so on that family the alias is translated in `/model` but
+`model.default` keeps the literal id. See
+[Provider families that ask the profile later](#provider-families-that-ask-the-profile-later).
+
+**5. When the provider ships a new release.** The next startup re-resolves and the
+alias moves with it. When the winner changes, the plugin logs one drift line:
+
+```
+model-aliases: opencode-go/glm-latest: glm-5.2 -> glm-5.3-flash (detected 2026-11-24T09:14:22)
+```
+
+The drift is also recorded in the cache file, see [Cache and drift](#cache-and-drift).
+
+## Support matrix
+
+Where an alias id can be used, verified against the Hermes call sites:
+
+| Config surface | Resolves | Notes |
 | --- | --- | --- |
-| `minContext` | `context >= minContext` | Fails (unknown context cannot be verified) |
-| `capabilities.tools` | `tool_call == the requested value` | Fails |
-| `capabilities.input` / `output` | every requested modality is present | Fails |
-| `minAge` | released on or before the cutoff | Passes (no evidence of recency) |
+| `model.default` | yes | Normalized at agent init, see the provider families below. |
+| `auxiliary.<task>.model`, including `vision` | yes | The auxiliary builder normalizes the model for the task's provider. |
+| `fallback_providers[].model` | yes | Normalized per fallback entry. |
+| `/model` picker | yes | The picker lists real ids plus alias ids. |
+| `delegation.model` | yes | Delegated children normalize the same way. |
+| `custom_providers[].model` | yes | Custom entries are wrapped like bundled providers, so their default model id is normalized too. |
+| `x_search.model` | no | The x_search tool calls xAI directly with the literal id, outside the provider profile seam. Use a concrete xAI model id there. |
 
-Boundaries are inclusive: a model with exactly `minContext` tokens passes, and a
-model released exactly at the `minAge` cutoff passes. `minAge` is compared by
-release date, so `48h` excludes models released today or yesterday.
+### Provider families that ask the profile later
 
-**Selection.** Survivors are ranked by newest `release_date` first (undated ids
-sort last), then by a natural version key descending (`glm-4.7` > `glm-4.6` >
-`glm-4`), then by id descending. Date is primary so a same-version `-preview`
-released before its base release loses to the base, while a preview of a
-genuinely newer version still wins on its later date.
+The plugin always answers on the provider profile: on every provider it wraps,
+`normalize_model_id()` returns the resolved id and `fetch_models()` lists the real ids
+plus the alias ids.
 
-**Alias independence.** Every alias is resolved on its own against the same
-candidate pool. An alias that matches nothing resolves to nothing and does not
-affect the others.
+Hermes' generic normalization, `normalize_model_for_provider()`, asks that profile for
+most providers, but a few families return before they do:
 
-## Resolution, cache and drift
+| Family | What `normalize_model_for_provider()` returns |
+| --- | --- |
+| `openrouter`, `nous`, `ai-gateway`, `kilocode` | The vendor-prefixed id (`z-ai/glm-latest`). |
+| `opencode-go`, `opencode-zen` | The name unchanged. |
+| `anthropic` | The name with dots replaced by hyphens. |
 
-**Candidate sources.**
+On those providers the alias id is still translated when you pick it in `/model`, because
+the picker calls the profile directly. The paths that go through the generic
+normalization (`model.default`, the auxiliary tasks, the fallbacks) need the **neutral
+alias name** instead of the real provider name — every wrap also answers to
+`alias-<provider>`, which dodges all three early-return lists:
 
-1. **models.dev** (`https://models.dev/api.json`) is the primary catalog. It
-   supplies release dates, context windows, tool support and modalities. One
-   fetch per process, shared by all targets; a failed fetch is retried after 60
-   seconds instead of on every target.
-2. **The target's live `/models` endpoint** (`<base_url>/models`, or the
-   provider's own `models_url`) is fetched when the cache is stale, when an alias
-   is still unresolved, or when the picker forces a refresh. It is required for
-   endpoints that are not on models.dev. Live fetches for different targets run
-   concurrently at startup.
+```yaml
+model:
+  provider: alias-opencode-go   # NOT opencode-go — early-return family
+  default: glm-latest           # resolves on the request path
 
-Both sources are merged by id, and models.dev entries win, because they carry the
-full metadata. Live-only ids contribute a thin candidate (id plus context window,
-if the endpoint reports one). Because undated ids sort behind dated ones, a brand
-new model that only appears on your endpoint loses to dated catalog models until
-it is indexed; give such a model a narrow `match` if that matters.
+auxiliary.anything:
+  provider: alias-opencode-go
+  model: glm-latest
+```
 
-**Startup budget.** Hermes allows 10 seconds per plugin load (configurable with
-`plugins.load_timeout_seconds`). A warm cache short-circuits with zero network
-calls; otherwise the plugin does one models.dev fetch plus at most one live fetch
-per target.
+On families that do ask the profile (gemini, groq, bedrock, custom endpoints, …) the
+real provider name works directly.
 
-**Warm cache.** A cached resolution is reused without any network call when both
-hold: it is younger than `refresh_seconds`, and it resolves every configured
-alias. Otherwise the plugin re-resolves.
+### Live example
 
-**Last-known-good.** If a re-resolution fails (network error, endpoint down), the
-previous mapping is kept and used. An alias that has never resolved is reported
-as an error instead.
+Against a real `opencode-go` catalog, a table of seven aliases resolves like this:
 
-**Drift.** When a re-resolution picks a different model for an alias, the change
-is logged and recorded in the cache history. The same alias can drift at most
-once per resolution, and the history keeps the 20 most recent events.
+```
+model-aliases: opencode-go resolved {'glm-latest': 'glm-5.3-flash', 'glm-flash-latest': 'glm-5.3-flash', 'kimi-code-latest': 'kimi-k2.7-code', 'mimo-pro-latest': 'mimo-v2.6-pro', 'mimo-flash-latest': 'mimo-v2.6-flash', 'minimax-latest': 'minimax-m3.1-flash-free', 'minimax-flash-latest': 'minimax-m3.1-flash'}
+```
 
-## Failure policy
+The `/model` picker for that provider shows the 50 real ids it serves plus the alias
+ids on top.
 
-- **Tolerant (default).** A target that cannot be described, or an alias that
-  cannot be resolved, is logged as an error. The other targets still register,
-  and a previously resolved alias keeps its last-known-good value.
-- **Strict (`strict: true`).** Any of those failures raises an error during
-  plugin load. Nothing is registered, so the alias provider does not exist at
-  all, and Hermes reports the failed import.
-- **Config errors** (unknown key, wrong type, bad glob) are always logged and
-  skip registration entirely, in both modes. The message names the exact key
-  path, for example `model-aliases: invalid config: targets.oc.aliases.fast.filter.minContext: expected a positive integer`.
+## Troubleshooting
 
-## Inspecting drift and the cache
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `model-aliases: provider 'opencode-go': alias(es) 'glm-latest' matched no models (check match globs against the catalog)` | No candidate matched `match`, or every candidate was excluded or filtered out. | Turn on `debug: true` and check the resolved map. Widen `match`, drop an over-strict `exclude`, or relax `filter` (unknown context or tool support fails a requirement). |
+| `model-aliases: alias 'glm-latest' matched no models on 'opencode-go'` | The alias is known but resolved to nothing on this provider. Logged once per (provider, alias) pair, the first time the alias is looked up there. | Same as above: the glob matches nothing this provider serves. |
+| The alias resolves but the agent reports an unknown model | The resolved id is not served by the provider, for example a catalog entry the endpoint does not implement. | Narrow `match` to the ids the endpoint really serves, or point `catalog_provider` at the right models.dev entry. |
+| The alias points at an old model after the provider released a new one | The cached resolution is younger than `refresh_seconds`. | Lower `refresh_seconds`, delete `~/.hermes/cache/model-aliases/opencode-go.json`, or open the `/model` picker, which forces a live refresh. |
+| Plugin does not load and Hermes reports an import error | `strict: true` and something failed: an unknown provider, or an unresolvable alias. | Read the message, it names the provider and the alias. Fix the cause, or set `strict: false` to degrade instead. |
+| `model-aliases: invalid config: <path>: <message>` | A typo or a wrong type in the `model_aliases:` section. | Fix the key path named in the message. Nothing is registered until it is valid. |
+| `unknown provider 'x' (not bundled, not under custom_providers/providers:)` | The provider name is neither a bundled provider nor a block under `custom_providers:` or `providers:`. | Add the block with an endpoint and reference it by that name. |
+| The provider receives the alias id itself (`glm-latest`) instead of the resolved model | The provider family returns before Hermes asks the provider profile (aggregators, `opencode-*`, `anthropic`). | Use the neutral `alias-<provider>` name in that block (`provider: alias-opencode-go`), or pick the alias in `/model`. See [Provider families that ask the profile later](#provider-families-that-ask-the-profile-later). |
+| The new alias is ignored | The config is read at plugin import only. | Restart Hermes after editing `model_aliases:`. |
+| `hermes doctor` does not show the provider as configured | The provider exposes no key env var (`key_env` unset, or the bundled provider has no non-URL env var). | Set `key_env` on the provider block. The wrapper carries the provider's own credential env var into the wrapped profile, so nothing else changes. |
 
-The plugin writes one JSON file per profile under
-`$HERMES_HOME/cache/model-aliases/` (`~/.hermes/cache/model-aliases/` by default),
-named after the profile, for example `alias-oc.json`:
+## Cache and drift
+
+The plugin writes one JSON file per provider under `$HERMES_HOME/cache/model-aliases/`
+(`~/.hermes/cache/model-aliases/` by default), named after the provider, for example
+`opencode-go.json`:
 
 ```json
 {
   "version": 1,
   "updated_at": 1764000000.0,
   "resolved": {
-    "fast": "glm-4.7",
-    "stable": "glm-4.7"
+    "glm-latest": "glm-5.3-flash"
   },
   "history": [
-    {"alias": "fast", "from": "glm-4.6", "to": "glm-4.7", "at": 1763990000.0}
+    {"alias": "glm-latest", "from": "glm-5.2", "to": "glm-5.3-flash", "at": 1763990000.0}
   ],
   "capabilities": {
-    "fast": {"id": "glm-4.7", "release_date": "2026-02-10", "limit": {"context": 200000}}
-  }
+    "glm-latest": {"id": "glm-5.3-flash", "release_date": "2026-08-26", "limit": {"context": 1000000}}
+  },
+  "real_ids": ["glm-5.2", "glm-5.3-flash"]
 }
 ```
 
-- `resolved` is the current alias to model id mapping.
+- `resolved` is the current alias to model id mapping for that provider.
 - `history` is the drift log, oldest first, capped at 20 entries.
-- `capabilities` caches the models.dev entry of each resolved model, so warm
-  starts keep picker badges and routing metadata without a network call.
+- `capabilities` caches the models.dev entry of each resolved model, so warm starts keep
+  picker badges and routing metadata without a network call.
+- `real_ids` is the provider's real model id list, used to populate the picker.
 - `updated_at` is the epoch timestamp of the last resolution and drives the
   `refresh_seconds` check.
-- A file with an unexpected `version` or malformed JSON is treated as "no cache",
-  so the next start resolves from scratch.
+- A file with an unexpected `version` or malformed JSON is treated as "no cache", so the
+  next start resolves from scratch.
+
+**Warm cache.** A cached resolution is reused without any network call when it is
+younger than `refresh_seconds` and it resolves every configured alias. Otherwise the
+plugin re-resolves.
+
+**Last-known-good.** If a re-resolution fails (network error, endpoint down), the
+previous mapping is kept and used. An alias that has never resolved is reported as an
+error instead.
+
+**Drift.** When a re-resolution picks a different model for an alias, the change is
+logged and recorded in the cache history. The same alias can drift at most once per
+resolution.
+
+To force a re-resolution, delete the cache file, or lower `refresh_seconds` and wait for
+it to expire. The `/model` picker also forces a live refresh, and a failed refresh never
+wipes a good snapshot.
 
 To see the drift lines, read the Hermes logs (`hermes logs`, i.e.
-`~/.hermes/logs/agent.log`) and look for the `model-aliases` logger:
+`~/.hermes/logs/agent.log`) and look for the `model-aliases` logger.
 
-```
-model-aliases: alias-oc/fast: glm-4.6 -> glm-4.7 (detected 2026-11-23T09:14:22)
-```
+## Failure policy
 
-With the default `plugins.isolation: in_process` the plugin logs into the Hermes
-log at INFO and above, so `debug: true` output shows up there. Under
-`plugins.isolation: host` the plugin runs in the plugin host, which forwards
-WARNING and above only, so the debug lines are not shown.
-
-To force a re-resolution, delete the cache file (or lower `refresh_seconds` and
-wait for it to expire). The `/model` picker also forces a live refresh, and a
-failed refresh never wipes a good snapshot.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| `model-aliases: target 'oc': alias(es) 'fast' resolved to no model (check match globs against the catalog)` | No candidate matched `match`, or every candidate was excluded or filtered out. | Turn on `debug: true` and check the resolved map. Widen `match`, drop an over-strict `exclude`, or relax `filter` (unknown context or tool support fails a requirement). |
-| The alias resolves but the agent reports an unknown model | The resolved id is not served by the target, for example a catalog entry the endpoint does not implement. | Narrow `match` to the ids the endpoint really serves, or point `catalog_provider` at the right models.dev entry. |
-| The alias points at an old model after the provider released a new one | The cached resolution is younger than `refresh_seconds`. | Lower `refresh_seconds`, delete `~/.hermes/cache/model-aliases/alias-<key>.json`, or open the `/model` picker, which forces a live refresh. |
-| `model-aliases: alias-oc: target 'qwen-oauth' uses auth_type='oauth'; an alias profile only carries api_key-style credentials, so inference may fail without an env key` | The target authenticates with OAuth. | Point the alias at a target that uses an api key, or declare the endpoint as a `providers:` block with `key_env` (or `api_key`) and alias that block instead. |
-| `model-aliases: alias-oc: providers.local uses key_cmd, which an alias profile cannot resolve; set key_env or api_key` | The named provider block fetches its key with a command. | Set `key_env` (preferred) or `api_key` on that block instead. |
-| Plugin does not load and Hermes reports an import error | `strict: true` and something failed: an unknown provider, a disabled target, or an unresolvable alias. | Read the message, it names the target and the alias. Fix the cause, or set `strict: false` to degrade instead. |
-| `model-aliases: invalid config: <path>: <message>` | A typo or a wrong type in the `model_aliases:` section. | Fix the key path named in the message. Nothing is registered until it is valid. |
-| `hermes doctor` does not list the alias profile | The target exposes no key env var (`key_env` unset, or the bundled provider has no non-URL env var). | Set `key_env` on the provider block. Doctor reads env vars only, so an inline `api_key` never shows as configured there. |
-| `unknown target provider 'x' (not bundled, not under providers:)` | The provider name is neither a bundled provider nor a block under `providers:`. | Add the block under `providers:` (mapping form, with an endpoint) and reference it as `custom:<name>`. |
-| `target 'x' resolves to a model-aliases profile (self-reference)` | The target points at an alias profile. | Point it at the real provider. |
-| The new alias is ignored | The config is read at plugin import only. | Restart Hermes after editing `model_aliases:`. |
+- **Tolerant (default).** A provider that cannot be described, or an alias that cannot
+  be resolved on it, is logged as an error. The other providers still register, and a
+  previously resolved alias keeps its last-known-good value.
+- **Strict (`strict: true`).** Any of those failures raises an error during plugin load.
+  Nothing is registered, and Hermes reports the failed import.
+- **Config errors** (unknown key, wrong type, empty pattern list) are always logged and
+  skip registration entirely, in both modes. The message names the exact key path, for
+  example `model-aliases: invalid config: model_aliases.glm-latest.filter.minContext: expected a positive integer`.
 
 ## Limitations
 
 - There is deliberately no `pin` option. A pinned alias is just a model id, and
-  `model.default` already covers that without this plugin.
-- OAuth-backed targets are not supported: an alias profile carries api-key-style
-  credentials only. You get a startup warning when you configure one.
-- `key_cmd`-only provider blocks cannot resolve, because the alias profile
-  cannot run a command to fetch the key.
+  `model.default` already covers that without this plugin. A pin would also freeze the
+  one thing this plugin exists to keep fluid.
+- `x_search.model` is not normalized, see [Support matrix](#support-matrix).
+- On the provider families listed in
+  [Provider families that ask the profile later](#provider-families-that-ask-the-profile-later),
+  `model.default`, the auxiliary tasks and the fallbacks keep the literal alias id. `/model`
+  resolves it.
+- A provider block that fetches its key with `key_cmd` gives this plugin no env var to
+  use. Declare `key_env` on the block instead.
 - Alias display names are not customizable. The picker shows the alias id.
-- Alias namespaces are per target. The same alias name under two targets is
-  two independent aliases with two independent resolutions.
-- Live-only model ids carry no release date, so they sort behind dated catalog
-  models.
+- Live-only model ids carry no release date, so they sort behind dated catalog models.
 - The config is read at plugin import. Restart Hermes after changing it.
 
 ## Development
 
 ```bash
-python3 -m pytest tests/ -q                                   # 104 unit tests, no Hermes needed
-HERMES_HOME=$(mktemp -d) ~/.hermes/hermes-agent/venv/bin/python tests/integration_smoke.py
+python3 -m pytest tests/ -q                                   # 114 unit tests, no Hermes needed
+MODEL_ALIASES_SMOKE_HOME=$(mktemp -d) ~/.hermes/hermes-agent/venv/bin/python tests/integration_smoke.py
 ```
 
-The smoke test loads the plugin exactly the way Hermes does (real loader, real
-provider registry, isolated `HERMES_HOME`, no network) and asserts registration,
-alias resolution, pass-through of concrete ids, the picker catalog and the
-strict-mode failure.
+The smoke test loads the plugin exactly the way Hermes does (real loader, real provider
+registry, isolated `HERMES_HOME`, no network) and asserts that the wrapped profile
+registers under the real provider name, that an alias resolves through it, that concrete
+ids pass through untouched, that the picker catalog holds real ids plus alias ids, that a
+`custom_providers` entry claims its `custom:<name>` alias, and that strict mode fails the
+load loudly.
 
 Layout:
 
-- `model_aliases/config.py` parses the `model_aliases:` section into typed
-  dataclasses and rejects unknown keys.
+- `model_aliases/config.py` parses the `model_aliases:` section into typed dataclasses and
+  rejects unknown keys. Pure.
 - `model_aliases/resolver.py` matches, filters and selects. Pure.
-- `model_aliases/catalog.py` sources candidates from models.dev and live
-  `/models`.
-- `model_aliases/state.py` owns the on-disk cache and drift history.
-- `model_aliases/plugin.py` is the Hermes seam: config loading, target
-  description, resolution, registration.
-- `model_aliases/profile.py` builds the `ProviderProfile` that serves the aliases.
+- `model_aliases/catalog.py` sources candidates from models.dev and live `/models`. Owns
+  all network access, behind the `_fetch_json` seam so tests can stub it.
+- `model_aliases/state.py` owns the on-disk cache and drift history. Pure.
+- `model_aliases/plugin.py` is the Hermes seam: config loading, provider discovery,
+  resolution, wrapping, registration.
+- `model_aliases/profile.py` wraps a provider profile and builds the `ProviderProfile` of
+  a custom entry.
 
 ## Contributing
 
 Bugs and pull requests are welcome.
 
 - **Reporting a bug.** Include your Hermes version, the relevant part of your
-  `model_aliases:` section (redact keys and URLs), the plugin log lines
-  (`hermes logs`, logger `model-aliases`), and the resolved map from the cache
-  file if it exists. A failing `match` glob against a known catalog is the most
-  useful thing to include.
-- **Submitting a pull request.** Branch from `main`, keep the change focused, and
-  make sure both test commands pass before opening it. New behavior needs a
-  unit test; changes to the Hermes seam need the smoke test updated too.
-- **Code standards.** `config.py`, `resolver.py` and `state.py` stay pure: no
-  network, no filesystem, no Hermes imports. `catalog.py` owns all network access
-  (models.dev and live `/models`) behind the `_fetch_json` seam so tests can
-  stub it. The Hermes seams stay in `plugin.py` and `profile.py`. Keep
-  `normalize_model_id()` free of I/O, it is on the hot path. Use type hints and
-  a module docstring that states the contract, keep error messages actionable
-  (they name the offending key path), and follow the existing frozen-dataclass
-  and pure-function style.
+  `model_aliases:` section (redact keys and URLs), the plugin log lines (`hermes logs`,
+  logger `model-aliases`), and the resolved map from the cache file if it exists. A
+  failing `match` glob against a known catalog is the most useful thing to include.
+- **Submitting a pull request.** Branch from `main`, keep the change focused, and make
+  sure both test commands pass before opening it. New behavior needs a unit test; changes
+  to the Hermes seam need the smoke test updated too.
+- **Code standards.** `config.py`, `resolver.py` and `state.py` stay pure: no network, no
+  filesystem, no Hermes imports. `catalog.py` owns all network access (models.dev and live
+  `/models`) behind the `_fetch_json` seam so tests can stub it. The Hermes seams stay in
+  `plugin.py` and `profile.py`. Keep `normalize_model_id()` free of I/O, it is on the hot
+  path. Use type hints and a module docstring that states the contract, keep error
+  messages actionable (they name the offending key path), and follow the existing
+  frozen-dataclass and pure-function style.
 
 ## License
 
-[MIT](LICENSE) — Copyright (c) 2026 Paul Chason.
+[MIT](LICENSE) - Copyright (c) 2026 Paul Chason.

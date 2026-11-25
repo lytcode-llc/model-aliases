@@ -118,7 +118,7 @@ def wrap_profile(
     prof = copy.deepcopy(target)
     prof.name = provider_name
     if extra_aliases:
-        prof.aliases = tuple(dict.fromkeys([*(target.aliases or ()), *extra_aliases]))
+        prof.aliases = tuple(dict.fromkeys([*(getattr(target, "aliases", ()) or ()), *extra_aliases]))
     prof._alias_ids = tuple(aliases.keys())
     prof._alias_names_lower = {a.lower() for a in aliases}
     prof._resolved = dict(resolved)

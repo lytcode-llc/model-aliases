@@ -381,7 +381,20 @@ def register_all() -> None:
     cache_dir = _hermes_home() / "cache" / "model-aliases"
     errors: list[str] = []
     described: list[tuple[str, ProviderDescriptor, Any, bool]] = []
-    for name, entry in referenced_providers(full, cfg).items():
+    referenced = referenced_providers(full, cfg)
+    # alias-<x> references resolve back to <x> for wrapping: the neutral name
+    # is an alias OF the real wrap, so describing it would be a chicken-and-egg
+    # miss (the alias exists only once the wrap registers).
+    resolved_refs: dict[str, Any] = {}
+    for name, entry in referenced.items():
+        real = name
+        if entry is None and name.startswith("alias-"):
+            from providers import get_provider_profile
+
+            if get_provider_profile(name[len("alias-"):]) is not None:
+                real = name[len("alias-"):]
+        resolved_refs.setdefault(real, entry)
+    for name, entry in resolved_refs.items():
         try:
             prof, desc = describe_provider(name, entry, full)
             described.append((name, desc, prof, entry is not None))
@@ -409,11 +422,17 @@ def register_all() -> None:
                     rid_meta=rid_meta,
                     real_ids=real_ids,
                     refresh=make_refresh(cfg, name, desc, cache_dir),
-                    # Custom entries claim BOTH forms: the explicit custom:<name>
-                    # and the bare name. The generic 'custom' profile declares
-                    # bare-name aliases (ollama/local/vllm/...) that would
-                    # otherwise route lookup(name) away from this wrapper.
-                    extra_aliases=(f"custom:{name}", name) if is_custom else (),
+                    # Every wrap also answers to alias-<provider>: Hermes'
+                    # normalize_model_for_provider early-returns for aggregator,
+                    # OpenCode-family and dot-hyphen providers BEFORE consulting
+                    # any profile, so request paths on those families need a
+                    # neutral name that dodges those lists. Custom entries also
+                    # claim custom:<name> and the bare name (the generic 'custom'
+                    # profile's bare-name aliases would hijack lookup).
+                    extra_aliases=(
+                        *((f"custom:{name}", name) if is_custom else ()),
+                        f"alias-{name}",
+                    ),
                 )
             )
         except Exception as e:
