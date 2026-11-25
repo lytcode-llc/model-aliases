@@ -76,7 +76,7 @@ original with three methods shadowed on the instance.
 
 | Method | What the wrapper does |
 | --- | --- |
-| `normalize_model_id()` | Maps an alias to the resolved concrete id. Pure dict lookup, no I/O. Returns `None` for real ids, so Hermes' generic normalization handles them unchanged. |
+| `normalize_model_id()` | **Identity mode** (chat_completions targets): a known alias returns `None` — the alias IS the model id everywhere (setup adopt, `/model` display, picker, persisted selection); the wire rewrite lives in the shadowed `build_api_kwargs_extras`. Pure dict lookups, no I/O. Real ids pass through unchanged. Non-chat_completions targets keep resolving here (no transport hook exists for them). |
 | `fetch_models()` | Returns the provider's real model ids plus the alias ids, for the `/model` picker. Forces a live re-resolution first, and a failed refresh keeps the current snapshot. |
 | `static_models` / `fallback_models` | Set to the alias ids — the picker's **curated floor** (`_build_curated_lists` reads these per plugin profile), so aliases are listed even when the live `/models` fetch fails or returns nothing. |
 | Group-row `fetch_models()` | A GROUP wrap returns **only its alias table** — the real catalog belongs to the target's own row. (The picker's canonical path calls `fetch_models()` directly; returning real ids there would list the raw catalog under the alias.) |
@@ -698,6 +698,8 @@ To see the drift lines, read the Hermes logs (`hermes logs`, i.e.
   (`z-ai/glm-5.3-flash`) is no longer stripped. Use the real provider name for those
   concrete ids.
 - `x_search.model` is not normalized, see [Support matrix](#support-matrix).
+- An **auxiliary task explicitly set to an alias** would send the alias on the wire (aux builds requests outside the chat_completions transport). Use a concrete id or `auto` (which picks the profile's concrete `default_aux_model`) for aux tasks — the recommended setup anyway.
+- Targets whose api_mode is **not** `chat_completions` (e.g. `anthropic_messages`) have no transport hook: they keep wire-first normalization, so their setup adopt shows the resolved id (identity not preserved there).
 - The `tts:` and `stt:` blocks carry their own provider and model ids. They do not go
   through the provider-profile seam, so alias slugs are not resolved there. Use a
   concrete model id.

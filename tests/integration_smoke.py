@@ -113,10 +113,15 @@ def main() -> int:
     assert profile.base_url == "http://127.0.0.1:9/v1", f"base_url not copied: {profile.base_url!r}"
     assert "custom:local-alias" in profile.aliases, f"custom:local claim missing: {profile.aliases!r}"
 
-    # 2/3. normalize resolves the alias; concrete ids pass through.
-    assert profile.normalize_model_id("glm-latest") == "glm-4.7"
-    assert profile.normalize_model_id("GLM-LATEST") == "glm-4.7"
+    # 2/3. IDENTITY mode: normalize returns None for aliases (no setup-adopt;
+    # the alias IS the model id everywhere) and the transport hook rewrites the
+    # wire model. Concrete ids pass through untouched.
+    assert profile._identity is True
+    assert profile.normalize_model_id("glm-latest") is None
+    assert profile.normalize_model_id("GLM-LATEST") is None
     assert profile.normalize_model_id("glm-4.7") is None
+    _extra, top = profile.build_api_kwargs_extras(model="glm-latest")
+    assert top.get("model") == "glm-4.7", f"transport rewrite must send the resolved id: {top!r}"
 
     # 4. Picker: real ids + alias ids.
     rows = profile.fetch_models()
@@ -131,7 +136,9 @@ def main() -> int:
     # family regression).
     from hermes_cli.model_normalize import normalize_model_for_provider
 
-    assert normalize_model_for_provider("glm-latest", "local-alias") == "glm-4.7"
+    # identity mode: generic normalization keeps the alias (no adopt); the wire
+    # rewrite happens in build_api_kwargs_extras (asserted above).
+    assert normalize_model_for_provider("glm-latest", "local-alias") == "glm-latest"
     # Pin the three early-return families (README's table).
     assert normalize_model_for_provider("glm-latest", "opencode-go") == "glm-latest"
     assert normalize_model_for_provider("glm-latest", "anthropic") == "glm-latest"  # no dots to convert

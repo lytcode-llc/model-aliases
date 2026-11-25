@@ -40,7 +40,7 @@ def _target(**kw):
     return _FakeProviderProfile(**defaults)
 
 
-def _wrap(target=None, *, resolved=None, caps=None, rid_meta=None, real_ids=None, refresh=None, extra_aliases=(), picker_alias_only=False):
+def _wrap(target=None, *, resolved=None, caps=None, rid_meta=None, real_ids=None, refresh=None, extra_aliases=(), picker_alias_only=False, identity_preserving=None):
     return wrap_profile(
         target or _target(),
         provider_name="test-provider",
@@ -52,22 +52,54 @@ def _wrap(target=None, *, resolved=None, caps=None, rid_meta=None, real_ids=None
         refresh=refresh,
         extra_aliases=extra_aliases,
         picker_alias_only=picker_alias_only,
+        identity_preserving=identity_preserving,
     )
 
 
 # --- normalize_model_id ----------------------------------------------------
 
 
-def test_normalize_resolves_alias():
+def test_normalize_identity_mode_returns_none_for_aliases():
+    """chat_completions wraps are identity-preserving: the alias IS the model
+    id (no setup-adopt); the wire rewrite lives in build_api_kwargs_extras."""
     p = _wrap()
+    assert p._identity is True
+    assert p.normalize_model_id("fast") is None
+    assert p.normalize_model_id("stable") is None
+
+
+def test_normalize_wire_first_mode_resolves():
+    """Non-chat_completions targets have no transport hook: normalize keeps
+    resolving so the wire stays correct (identity adopts there — documented)."""
+    p = _wrap(identity_preserving=False)
+    assert p._identity is False
     assert p.normalize_model_id("fast") == "tcl-4.1"
     assert p.normalize_model_id("stable") == "glm-4.7"
 
 
-def test_normalize_case_insensitive_and_strips():
+def test_normalize_case_insensitive_identity():
     p = _wrap()
-    assert p.normalize_model_id("FAST") == "tcl-4.1"
-    assert p.normalize_model_id("  stable  ") == "glm-4.7"
+    # case-insensitive: even mangled case is recognized as an alias (None, not a hit)
+    assert p.normalize_model_id("FAST") is None
+    assert p.normalize_model_id("  stable  ") is None
+    # and the rewrite hook resolves the mangled case to the wire id
+    top = p.build_api_kwargs_extras(model="  FAST  ")[1]
+    assert top["model"] == "tcl-4.1"
+
+
+def test_transport_rewrite_sends_resolved_wire_id():
+    """The chat_completions transport merges this hook's top-level dict AFTER
+    setting api_kwargs['model'], so 'model' here overrides the alias."""
+    p = _wrap()
+    extra, top = p.build_api_kwargs_extras(model="fast")
+    assert top["model"] == "tcl-4.1"
+    # real ids pass through untouched (no alias hit)
+    _extra2, top2 = p.build_api_kwargs_extras(model="tcl-4.1")
+    assert "model" not in top2
+    # identity off -> no rewrite hook installed at all (wire-first mode)
+    p2 = _wrap(identity_preserving=False)
+    assert p2._identity is False
+    assert "build_api_kwargs_extras" not in vars(p2)  # no instance shadow
 
 
 def test_normalize_unknown_slug_returns_none():
@@ -157,7 +189,8 @@ def test_fetch_models_survives_refresh_exception():
 
     p = _wrap(refresh=refresh)
     assert p.fetch_models() == ["tcl-4.1", "glm-4.7", "fast", "stable"]
-    assert p.normalize_model_id("fast") == "tcl-4.1"
+    assert p._resolved_lower["fast"] == "tcl-4.1"  # snapshot intact
+    assert p.normalize_model_id("fast") is None  # identity mode
 
 
 def test_fetch_models_empty_refresh_does_not_wipe_snapshot():
@@ -166,7 +199,7 @@ def test_fetch_models_empty_refresh_does_not_wipe_snapshot():
 
     p = _wrap(refresh=refresh)
     p.fetch_models()
-    assert p.normalize_model_id("fast") == "tcl-4.1"
+    assert p._resolved_lower["fast"] == "tcl-4.1"  # empty refresh kept the snapshot
 
 
 def test_fetch_models_successful_refresh_swaps_state():
@@ -181,7 +214,8 @@ def test_fetch_models_successful_refresh_swaps_state():
     p = _wrap(refresh=refresh)
     # real_ids are replaced by the refresh tuple; aliases are appended after
     assert p.fetch_models() == ["tcl-5.0", "fast", "stable"]
-    assert p.normalize_model_id("fast") == "tcl-5.0"
+    assert p._resolved_lower["fast"] == "tcl-5.0"  # state swap proven
+    assert p.build_api_kwargs_extras(model="fast")[1]["model"] == "tcl-5.0"  # wire rewrite sees the swap
     assert p.model_capabilities["fast"]["limit"]["context"] == 256000
     assert p.live_context_length("fast") == 256000
     assert p._real_ids == ["tcl-5.0"]
