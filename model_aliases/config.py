@@ -1,8 +1,10 @@
-"""Parse the flat ``model_aliases:`` section of ~/.hermes/config.yaml (pure).
+"""Parse the two-scope ``model_aliases:`` section of ~/.hermes/config.yaml (pure).
 
-v2 schema: a flat global alias table. Top-level keys (except the reserved
-``wrap_all``) are alias slugs; values are alias specs. There is no provider
-scoping — aliases resolve against whatever provider a consumer block names.
+v3 schema: developer-named provider-alias groups (each group's ``provider``
+is the model-slug prefix identifying its target) plus a global scope that
+resolves on every wrapped provider. No model slugs, patterns, alias names or
+provider references are hard-coded here — everything user-specific lives in
+config.yaml.
 """
 
 from __future__ import annotations
@@ -30,11 +32,21 @@ class AliasSpec:
 
 
 @dataclass(frozen=True)
+class ProviderGroup:
+    """A developer-named provider-alias group."""
+
+    key: str  # developer-chosen provider alias name (e.g. ocg-alias)
+    provider: str  # model-slug prefix identifying the target provider
+    aliases: dict[str, AliasSpec]
+
+
+@dataclass(frozen=True)
 class AliasesConfig:
     wrap_all: bool = False
     strict: bool = False
     debug: bool = False
     refresh_seconds: int = 3600
+    groups: dict[str, ProviderGroup] = field(default_factory=dict)
     aliases: dict[str, AliasSpec] = field(default_factory=dict)
 
 
@@ -138,14 +150,39 @@ def _parse_alias(path: str, raw: Any) -> AliasSpec:
     )
 
 
+def _parse_group(path: str, key: str, raw: Any) -> ProviderGroup:
+    if not isinstance(raw, dict):
+        _err(path, f"expected a mapping, got {type(raw).__name__}")
+    # 'provider' is reserved; every other key is an alias slug parsed below
+    # (its value shape is validated by _parse_alias).
+    if "provider" not in raw:
+        _err(f"{path}.provider", "required (the model-slug prefix identifying the provider)")
+    prefix = raw["provider"]
+    if not isinstance(prefix, str) or not prefix.strip():
+        _err(f"{path}.provider", "expected a non-empty string")
+    aliases: dict[str, AliasSpec] = {}
+    for slug, spec_raw in raw.items():
+        if slug == "provider":
+            continue
+        apath = f"{path}.{slug}"
+        aliases[slug] = _parse_alias(apath, spec_raw)
+    if not aliases:
+        _err(path, "group must declare at least one model alias")
+    return ProviderGroup(key=key, provider=prefix.strip(), aliases=aliases)
+
+
 def parse(raw: dict | None) -> AliasesConfig:
     """Parse the ``model_aliases:`` section. ``{}``/``None`` -> defaults (no aliases)."""
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
         _err("model_aliases", f"expected a mapping, got {type(raw).__name__}")
-    # Every non-reserved top-level key is an alias slug by definition —
-    # unknown-key validation lives in _parse_alias on each value's shape.
+    _unknown(
+        "model_aliases",
+        raw,
+        {"provider_alias_to_many_model_aliases", "model_alias_to_all_provider_aliases",
+         "wrap_all", "strict", "debug", "refresh_seconds"},
+    )
 
     wrap_all = raw.get("wrap_all", False)
     if not isinstance(wrap_all, bool):
@@ -160,18 +197,29 @@ def parse(raw: dict | None) -> AliasesConfig:
     if not isinstance(refresh, int) or isinstance(refresh, bool) or refresh <= 0:
         _err("refresh_seconds", "expected a positive integer")
 
-    reserved = {"wrap_all", "strict", "debug", "refresh_seconds"}
+    groups: dict[str, ProviderGroup] = {}
+    groups_raw = raw.get("provider_alias_to_many_model_aliases", {})
+    if not isinstance(groups_raw, dict):
+        _err("provider_alias_to_many_model_aliases", f"expected a mapping, got {type(groups_raw).__name__}")
+    for gkey, gval in groups_raw.items():
+        gpath = f"provider_alias_to_many_model_aliases.{gkey}"
+        if not isinstance(gkey, str) or not gkey.strip():
+            _err("provider_alias_to_many_model_aliases", "group names must be non-empty strings")
+        groups[gkey] = _parse_group(gpath, gkey, gval)
+
     aliases: dict[str, AliasSpec] = {}
-    for key, spec_raw in raw.items():
-        if key in reserved:
-            continue
-        apath = f"model_aliases.{key}"
-        aliases[key] = _parse_alias(apath, spec_raw)
+    globals_raw = raw.get("model_alias_to_all_provider_aliases", {})
+    if not isinstance(globals_raw, dict):
+        _err("model_alias_to_all_provider_aliases", f"expected a mapping, got {type(globals_raw).__name__}")
+    for slug, spec_raw in globals_raw.items():
+        apath = f"model_alias_to_all_provider_aliases.{slug}"
+        aliases[slug] = _parse_alias(apath, spec_raw)
 
     return AliasesConfig(
         wrap_all=wrap_all,
         strict=strict,
         debug=debug,
         refresh_seconds=refresh,
+        groups=groups,
         aliases=aliases,
     )

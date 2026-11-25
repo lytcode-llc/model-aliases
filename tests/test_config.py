@@ -1,4 +1,4 @@
-"""config.parse: flat v2 schema defaults, round-trip, and ConfigErrors."""
+"""config.parse: v3 two-scope schema round-trip and ConfigError paths."""
 
 from __future__ import annotations
 
@@ -7,24 +7,39 @@ import pytest
 from model_aliases.config import ConfigError, parse
 
 
+def _group(name: str = "ocg-alias", provider: str = "opencode-go") -> dict:
+    return {
+        "provider": provider,
+        "fast": {"match": ["tcl-*"]},
+        "stable": {"match": ["tcl-4.7*"]},
+    }
+
+
 def _full() -> dict:
     return {
         "wrap_all": True,
         "strict": True,
         "debug": True,
         "refresh_seconds": 120,
-        "fast": {
-            "match": "glm-*",
-            "exclude": ["*-preview", "glm-legacy*"],
-            "filter": {
-                "minContext": 128000,
-                "capabilities": {"tools": True, "input": ["text", "image"], "output": "text"},
-                "minAge": "48h",
+        "provider_alias_to_many_model_aliases": {
+            "ocg-alias": {
+                "provider": "opencode-go",
+                "fast": {
+                    "match": "glm-*",
+                    "exclude": ["*-preview", "glm-legacy*"],
+                    "filter": {
+                        "minContext": 128000,
+                        "capabilities": {"tools": True, "input": ["text", "image"], "output": "text"},
+                        "minAge": "48h",
+                    },
+                    "select": {"strategy": "latest"},
+                },
+                "stable": {"match": ["glm-4.7*"]},
             },
-            "select": {"strategy": "latest"},
         },
-        "stable": {"match": ["glm-4.7*"]},
-        "local": {"match": ["qwen*"]},
+        "model_alias_to_all_provider_aliases": {
+            "local": {"match": ["qwen*"]},
+        },
     }
 
 
@@ -34,6 +49,7 @@ def test_parse_empty_is_defaults():
     assert cfg.strict is False
     assert cfg.debug is False
     assert cfg.refresh_seconds == 3600
+    assert cfg.groups == {}
     assert cfg.aliases == {}
     assert parse(None).aliases == {}
 
@@ -44,8 +60,12 @@ def test_parse_full_roundtrip():
     assert cfg.strict is True
     assert cfg.debug is True
     assert cfg.refresh_seconds == 120
-    assert list(cfg.aliases) == ["fast", "stable", "local"]
-    fast = cfg.aliases["fast"]
+    assert list(cfg.groups) == ["ocg-alias"]
+    group = cfg.groups["ocg-alias"]
+    assert group.key == "ocg-alias"
+    assert group.provider == "opencode-go"
+    assert list(group.aliases) == ["fast", "stable"]
+    fast = group.aliases["fast"]
     assert fast.match == ("glm-*",)
     assert fast.exclude == ("*-preview", "glm-legacy*")
     assert fast.min_context == 128000
@@ -53,15 +73,56 @@ def test_parse_full_roundtrip():
     assert fast.input_modalities == ("text", "image")
     assert fast.output_modalities == ("text",)
     assert fast.min_age_hours == 48
-    assert cfg.aliases["stable"].match == ("glm-4.7*",)
+    assert group.aliases["stable"].match == ("glm-4.7*",)
     assert cfg.aliases["local"].match == ("qwen*",)
 
 
+def test_groups_roundtrip():
+    cfg = parse({
+        "provider_alias_to_many_model_aliases": {
+            "ocg-alias": _group(),
+        },
+    })
+    assert len(cfg.groups) == 1
+    assert "ocg-alias" in cfg.groups
+    assert cfg.groups["ocg-alias"].provider == "opencode-go"
+    assert list(cfg.groups["ocg-alias"].aliases) == ["fast", "stable"]
+
+
+def test_global_roundtrip():
+    cfg = parse({
+        "model_alias_to_all_provider_aliases": {
+            "glm-latest": {"match": ["glm-*"]},
+        },
+    })
+    assert cfg.aliases["glm-latest"].match == ("glm-*",)
+
+
 def test_min_age_units():
-    cfg = parse({"a": {"match": "x*", "filter": {"minAge": "3d"}}})
+    cfg = parse({
+        "model_alias_to_all_provider_aliases": {
+            "a": {"match": "x*", "filter": {"minAge": "3d"}},
+        },
+    })
     assert cfg.aliases["a"].min_age_hours == 72
-    cfg2 = parse({"a": {"match": "x*", "filter": {"minAge": "12h"}}})
+    cfg2 = parse({
+        "model_alias_to_all_provider_aliases": {
+            "a": {"match": "x*", "filter": {"minAge": "12h"}},
+        },
+    })
     assert cfg2.aliases["a"].min_age_hours == 12
+
+
+def test_provider_value_is_stripped():
+    cfg = parse({
+        "provider_alias_to_many_model_aliases": {
+            "ocg-alias": {
+                "provider": " opencode-go ",
+                "fast": {"match": "tcl-*"},
+            },
+        },
+    })
+    assert cfg.groups["ocg-alias"].provider == "opencode-go"
 
 
 def _expect_error(fragment: str, raw: dict):
@@ -70,104 +131,352 @@ def _expect_error(fragment: str, raw: dict):
     assert fragment in str(ei.value), f"{fragment!r} not in {str(ei.value)!r}"
 
 
-def test_top_level_keys_are_aliases_by_definition():
-    # A typo at the top level is now just an alias slug; it only fails when its value is malformed.
-    cfg = parse({"stric": {"match": "x*"}})
-    assert "stric" in cfg.aliases
+# --- reserved scalar errors ------------------------------------------------
 
 
-def test_typo_in_reserved_scalar_still_errors():
-    _expect_error("strict", {"strict": "yes"})
+def test_bad_wrap_all():
     _expect_error("wrap_all", {"wrap_all": "yes"})
+
+
+def test_bad_strict():
+    _expect_error("strict", {"strict": "yes"})
+
+
+def test_bad_debug():
     _expect_error("debug", {"debug": "yes"})
+
+
+def test_bad_refresh_seconds():
     _expect_error("refresh_seconds", {"refresh_seconds": 0})
     _expect_error("refresh_seconds", {"refresh_seconds": True})
+    _expect_error("refresh_seconds", {"refresh_seconds": -1})
 
 
-def test_unknown_alias_value_key():
-    _expect_error("model_aliases.glm-latest", {"glm-latest": {"match": "x", "matchy": "y"}})
+# --- top-level unknown key errors ------------------------------------------
 
 
-def test_unknown_filter_key():
+def test_unknown_top_level_key():
+    _expect_error("model_aliases", {"unknown_key": {}})
+
+
+def test_flat_alias_keys_rejected_at_top_level():
+    # v2 flat alias keys are now unknown at the top level.
+    _expect_error("model_aliases", {"fast": {"match": "x*"}})
+
+
+# --- group-level errors -----------------------------------------------------
+
+
+def test_group_missing_provider():
     _expect_error(
-        "model_aliases.fast.filter",
-        {"fast": {"match": "x", "filter": {"miniContext": 1}}},
+        "provider_alias_to_many_model_aliases.ocg-alias.provider",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {"fast": {"match": "x*"}},
+            },
+        },
     )
 
 
-def test_unknown_capabilities_key():
+def test_group_provider_empty():
     _expect_error(
-        "model_aliases.fast.filter.capabilities",
-        {"fast": {"match": "x", "filter": {"capabilities": {"toolz": True}}}},
+        "provider_alias_to_many_model_aliases.ocg-alias.provider",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {"provider": "   ", "fast": {"match": "x*"}},
+            },
+        },
     )
 
 
-def test_missing_match():
-    _expect_error("model_aliases.fast.match", {"fast": {}})
-
-
-def test_empty_match_list():
-    _expect_error("model_aliases.fast.match", {"fast": {"match": []}})
-
-
-def test_strategy_not_latest():
+def test_group_provider_not_string():
     _expect_error(
-        "model_aliases.fast.select.strategy",
-        {"fast": {"match": "x", "select": {"strategy": "oldest"}}},
+        "provider_alias_to_many_model_aliases.ocg-alias.provider",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {"provider": 123, "fast": {"match": "x*"}},
+            },
+        },
     )
 
 
-def test_min_context_non_positive():
+def test_group_zero_aliases():
     _expect_error(
-        "model_aliases.fast.filter.minContext",
-        {"fast": {"match": "x", "filter": {"minContext": 0}}},
-    )
-    _expect_error(
-        "model_aliases.fast.filter.minContext",
-        {"fast": {"match": "x", "filter": {"minContext": "128k"}}},
-    )
-
-
-def test_min_age_bad_format():
-    _expect_error(
-        "model_aliases.fast.filter.minAge",
-        {"fast": {"match": "x", "filter": {"minAge": "2 days"}}},
+        "provider_alias_to_many_model_aliases.ocg-alias",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {"provider": "opencode-go"},
+            },
+        },
     )
 
 
-def test_tools_not_bool():
+def test_group_not_mapping():
     _expect_error(
-        "model_aliases.fast.filter.capabilities.tools",
-        {"fast": {"match": "x", "filter": {"capabilities": {"tools": "yes"}}}},
+        "provider_alias_to_many_model_aliases.ocg-alias",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": ["fast"],
+            },
+        },
     )
 
 
-def test_alias_value_not_mapping():
-    _expect_error("model_aliases.fast", {"fast": "glm-*"})
-
-
-def test_bad_types_in_filter():
-    _expect_error("model_aliases.fast.filter", {"fast": {"match": "x", "filter": ["minContext"]}})
+def test_groups_not_mapping():
     _expect_error(
-        "model_aliases.fast.filter.capabilities",
-        {"fast": {"match": "x", "filter": {"capabilities": []}}},
+        "provider_alias_to_many_model_aliases",
+        {"provider_alias_to_many_model_aliases": ["ocg-alias"]},
     )
 
 
-def test_bad_modalities_types():
+# --- alias spec errors (inside groups) --------------------------------------
+
+
+def test_group_unknown_alias_value_key():
     _expect_error(
-        "model_aliases.fast.filter.capabilities.input",
-        {"fast": {"match": "x", "filter": {"capabilities": {"input": 123}}}},
-    )
-    _expect_error(
-        "model_aliases.fast.filter.capabilities.output",
-        {"fast": {"match": "x", "filter": {"capabilities": {"output": {}}}}},
+        "provider_alias_to_many_model_aliases.ocg-alias.fast",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "matchy": "y"},
+                },
+            },
+        },
     )
 
 
-def test_pattern_items_are_stripped():
-    cfg = parse({"a": {"match": ["  glm-* "], "exclude": [" *-preview  "]}})
-    assert cfg.aliases["a"].match == ("glm-*",)
-    assert cfg.aliases["a"].exclude == ("*-preview",)
-    # padding-only items are rejected, not silently dropped
-    _expect_error("model_aliases.a.match[0]", {"a": {"match": ["   "]}})
+def test_group_unknown_filter_key():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.filter",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "filter": {"miniContext": 1}},
+                },
+            },
+        },
+    )
+
+
+def test_group_unknown_capabilities_key():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.filter.capabilities",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "filter": {"capabilities": {"toolz": True}}},
+                },
+            },
+        },
+    )
+
+
+def test_group_missing_match():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.match",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {"provider": "opencode-go", "fast": {}},
+            },
+        },
+    )
+
+
+def test_group_empty_match_list():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.match",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {"provider": "opencode-go", "fast": {"match": []}},
+            },
+        },
+    )
+
+
+def test_group_strategy_not_latest():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.select.strategy",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "select": {"strategy": "oldest"}},
+                },
+            },
+        },
+    )
+
+
+def test_group_min_context_non_positive():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.filter.minContext",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "filter": {"minContext": 0}},
+                },
+            },
+        },
+    )
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.filter.minContext",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "filter": {"minContext": "128k"}},
+                },
+            },
+        },
+    )
+
+
+def test_group_min_age_bad_format():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.filter.minAge",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "filter": {"minAge": "2 days"}},
+                },
+            },
+        },
+    )
+
+
+def test_group_tools_not_bool():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.filter.capabilities.tools",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "filter": {"capabilities": {"tools": "yes"}}},
+                },
+            },
+        },
+    )
+
+
+def test_group_alias_value_not_mapping():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {"provider": "opencode-go", "fast": "glm-*"},
+            },
+        },
+    )
+
+
+def test_group_bad_types_in_filter():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.filter",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "filter": ["minContext"]},
+                },
+            },
+        },
+    )
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.filter.capabilities",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "filter": {"capabilities": []}},
+                },
+            },
+        },
+    )
+
+
+def test_group_bad_modalities_types():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.filter.capabilities.input",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "filter": {"capabilities": {"input": 123}}},
+                },
+            },
+        },
+    )
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.fast.filter.capabilities.output",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "fast": {"match": "x", "filter": {"capabilities": {"output": {}}}},
+                },
+            },
+        },
+    )
+
+
+def test_group_pattern_items_are_stripped():
+    cfg = parse({
+        "provider_alias_to_many_model_aliases": {
+            "ocg-alias": {
+                "provider": "opencode-go",
+                "a": {"match": ["  glm-* "], "exclude": [" *-preview  "]},
+            },
+        },
+    })
+    assert cfg.groups["ocg-alias"].aliases["a"].match == ("glm-*",)
+    assert cfg.groups["ocg-alias"].aliases["a"].exclude == ("*-preview",)
+
+
+def test_group_padding_only_items_rejected():
+    _expect_error(
+        "provider_alias_to_many_model_aliases.ocg-alias.a.match[0]",
+        {
+            "provider_alias_to_many_model_aliases": {
+                "ocg-alias": {
+                    "provider": "opencode-go",
+                    "a": {"match": ["   "]},
+                },
+            },
+        },
+    )
+
+
+# --- alias spec errors (global scope) ---------------------------------------
+
+
+def test_global_unknown_alias_value_key():
+    _expect_error(
+        "model_alias_to_all_provider_aliases.glm-latest",
+        {"model_alias_to_all_provider_aliases": {"glm-latest": {"match": "x", "matchy": "y"}}},
+    )
+
+
+def test_global_missing_match():
+    _expect_error(
+        "model_alias_to_all_provider_aliases.glm-latest.match",
+        {"model_alias_to_all_provider_aliases": {"glm-latest": {}}},
+    )
+
+
+def test_global_alias_value_not_mapping():
+    _expect_error(
+        "model_alias_to_all_provider_aliases.glm-latest",
+        {"model_alias_to_all_provider_aliases": {"glm-latest": "glm-*"}},
+    )
+
+
+def test_global_not_mapping():
+    _expect_error(
+        "model_alias_to_all_provider_aliases",
+        {"model_alias_to_all_provider_aliases": ["glm-latest"]},
+    )
