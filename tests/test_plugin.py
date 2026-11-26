@@ -487,11 +487,22 @@ def test_register_all_strict_registers_nothing_with_ghost_group(
     assert stub_providers == []  # nothing registered despite 'local' resolving first
 
 
-def test_register_all_config_error_registers_nothing(tmp_path, monkeypatch, stub_providers, caplog):
+def test_register_all_config_error_fails_loudly(tmp_path, monkeypatch, stub_providers, caplog):
+    """Invalid config must RAISE so Hermes surfaces the load failure (startup
+    warning / `hermes plugins`) — a log-only path was invisible in the TUI."""
     with caplog.at_level(logging.ERROR, logger="model-aliases"):
-        _run_register_all(monkeypatch, tmp_path, {"provider_alias_to_many_model_aliases": {"a": "bad"}})
+        with pytest.raises(ConfigError, match="invalid config"):
+            _run_register_all(monkeypatch, tmp_path, {"provider_alias_to_many_model_aliases": {"a": "bad"}})
     assert stub_providers == []
     assert any("invalid config" in r.message for r in caplog.records)
+
+
+def test_register_all_empty_group_fails_loudly(tmp_path, monkeypatch, stub_providers):
+    """The fw-alias regression: a group whose aliases are all commented out."""
+    raw = {"provider_alias_to_many_model_aliases": {"fw-alias": {"provider": "accounts/fireworks/models"}}}
+    with pytest.raises(ConfigError, match="fw-alias"):
+        _run_register_all(monkeypatch, tmp_path, raw)
+    assert stub_providers == []
 
 
 def test_register_all_empty_config_is_noop(tmp_path, monkeypatch, stub_providers):

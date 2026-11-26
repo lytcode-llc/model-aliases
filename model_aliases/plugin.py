@@ -458,10 +458,12 @@ def register_all() -> None:
     try:
         cfg = parse(raw)
     except ConfigError as e:
+        # Raise (not just log): Hermes surfaces an import failure as a startup
+        # warning and in `hermes plugins`, so an invalid section is VISIBLE.
+        # Operationally identical to log-and-return (zero registration either
+        # way) — only the visibility changes.
         logger.error("model-aliases: invalid config: %s", e)
-        if isinstance(raw, dict) and raw.get("strict") is True:
-            raise  # strict must not silently disable aliases on a schema typo
-        return
+        raise ConfigError(f"invalid config: {e}") from e
     if not cfg.groups and not cfg.aliases:
         return
     try:

@@ -167,7 +167,7 @@ def _parse_group(path: str, key: str, raw: Any) -> ProviderGroup:
         apath = f"{path}.{slug}"
         aliases[slug] = _parse_alias(apath, spec_raw)
     if not aliases:
-        _err(path, "group must declare at least one model alias")
+        _err(path, "group must declare at least one model alias (every alias is missing or commented out) — remove the group or give it at least one alias")
     return ProviderGroup(key=key, provider=prefix.strip(), aliases=aliases)
 
 
