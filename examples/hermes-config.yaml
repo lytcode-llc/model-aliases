@@ -1,14 +1,10 @@
-# model_aliases block for ~/.hermes/config.yaml (v3 group schema)
+# model_aliases block for ~/.hermes/config.yaml (groups-only)
 #
-# Two scopes:
-#   - provider_alias_to_many_model_aliases: developer-named provider aliases.
-#     Each group's `provider` is the model-slug prefix identifying its target
-#     (bundled provider name, or the slug namespace of a custom entry). Use the
-#     group name as the provider in every consumer block.
-#   - model_alias_to_all_provider_aliases: global aliases resolved on every
-#     wrapped provider.
+# Scope: provider_alias_to_many_model_aliases — developer-named provider
+# aliases. Each group's `provider` is the model-slug prefix identifying its
+# target (bundled provider name, or the slug namespace of a custom entry).
+# Use the group name as the provider in every consumer block:
 #
-# Examples:
 #   model:      { provider: ocg-alias, default: glm-latest }
 #   auxiliary.x: { provider: ocg-alias, model: glm-latest }
 #   fallback_providers: [{ provider: ocg-alias, model: glm-latest }]
@@ -16,35 +12,35 @@
 # Note: aliases on the early-return families (aggregators, opencode-*,
 # anthropic) REQUIRE the group name — the real provider name never resolves
 # alias slugs there. Concrete ids use the real provider name.
+#
+# (The former model_alias_to_all_provider_aliases global scope is shelved —
+# see the BACKLOG in PLAN.md.)
 
 model_aliases:
-  # wrap_all: true   # also wrap providers not referenced in config (eager, parallel)
+  # strict: false        # true: fail the plugin load instead of degrading
+  # debug: false         # log every resolution
+  # refresh_seconds: 3600 # how long a cached resolution is trusted
 
   provider_alias_to_many_model_aliases:
     ocg-alias:
       provider: opencode-go
       glm-latest:
         match: ["opencode-go/glm-*"]
+      glm-flash-latest:
+        match: ["opencode-go/glm-*-flash"]
       kimi-code-latest:
         match: ["opencode-go/kimi-*-code"]
+      mimo-pro-latest:
+        match: ["opencode-go/mimo-*-pro"]
+      mimo-flash-latest:
+        match: ["opencode-go/mimo-*-flash"]
+      minimax-latest:
+        match: ["opencode-go/minimax-*"]
+      minimax-flash-latest:
+        match: ["opencode-go/minimax-*-flash"]
 
     # fw-alias:
     #   provider: accounts/fireworks/models   # slug namespace of the fireworks entry
-    #   kimi-code-latest:
-    #     match: ["kimi-*-code"]              # suffix rule reaches the full slug
-
-  model_alias_to_all_provider_aliases:
-    mimo-pro-latest:
-      match: ["mimo-*-pro"]
-      # exclude: ["*-preview"]
-      # filter:
-      #   minContext: 128000
-      #   minAge: 48h
-      #   capabilities: { tools: true, input: [text] }
-      # select: { strategy: latest }   # default; only strategy supported
-    mimo-flash-latest:
-      match: ["mimo-*-flash"]
-    minimax-latest:
-      match: ["minimax-*"]
-    minimax-flash-latest:
-      match: ["minimax-*-flash"]
+    #   glm-latest:
+    #     match: ["glm-*"]                    # suffix rule reaches both models/ and routers/
+    #     exclude: ["*/routers/*"]            # optional: never land on a router id

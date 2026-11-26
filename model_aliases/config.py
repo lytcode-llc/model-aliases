@@ -42,12 +42,10 @@ class ProviderGroup:
 
 @dataclass(frozen=True)
 class AliasesConfig:
-    wrap_all: bool = False
     strict: bool = False
     debug: bool = False
     refresh_seconds: int = 3600
     groups: dict[str, ProviderGroup] = field(default_factory=dict)
-    aliases: dict[str, AliasSpec] = field(default_factory=dict)
 
 
 _MIN_AGE_RE = re.compile(r"^[0-9]+(h|d)$")
@@ -180,13 +178,9 @@ def parse(raw: dict | None) -> AliasesConfig:
     _unknown(
         "model_aliases",
         raw,
-        {"provider_alias_to_many_model_aliases", "model_alias_to_all_provider_aliases",
-         "wrap_all", "strict", "debug", "refresh_seconds"},
+        {"provider_alias_to_many_model_aliases", "strict", "debug", "refresh_seconds"},
     )
 
-    wrap_all = raw.get("wrap_all", False)
-    if not isinstance(wrap_all, bool):
-        _err("wrap_all", "expected a boolean")
     strict = raw.get("strict", False)
     if not isinstance(strict, bool):
         _err("strict", "expected a boolean")
@@ -208,19 +202,9 @@ def parse(raw: dict | None) -> AliasesConfig:
         gkey = gkey.strip()
         groups[gkey] = _parse_group(gpath, gkey, gval)
 
-    aliases: dict[str, AliasSpec] = {}
-    globals_raw = raw.get("model_alias_to_all_provider_aliases", {})
-    if not isinstance(globals_raw, dict):
-        _err("model_alias_to_all_provider_aliases", f"expected a mapping, got {type(globals_raw).__name__}")
-    for slug, spec_raw in globals_raw.items():
-        apath = f"model_alias_to_all_provider_aliases.{slug}"
-        aliases[slug] = _parse_alias(apath, spec_raw)
-
     return AliasesConfig(
-        wrap_all=wrap_all,
         strict=strict,
         debug=debug,
         refresh_seconds=refresh,
         groups=groups,
-        aliases=aliases,
     )

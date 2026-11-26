@@ -16,7 +16,6 @@ from model_aliases.config import AliasSpec, ConfigError, ProviderGroup, parse
 from model_aliases.plugin import (
     TargetError,
     early_return_reason,
-    referenced_providers,
     register_all,
     resolve_group_provider,
     resolve_target,
@@ -35,16 +34,6 @@ def _cfg_raw_groups(**over) -> dict:
                 "provider": "opencode-go",
                 "fast": {"match": ["tcl-*"]},
             },
-        },
-    }
-    raw.update(over)
-    return raw
-
-
-def _cfg_raw_global(**over) -> dict:
-    raw = {
-        "model_alias_to_all_provider_aliases": {
-            "fast": {"match": ["tcl-*"]},
         },
     }
     raw.update(over)
@@ -169,143 +158,6 @@ def test_early_return_reason_import_failure(monkeypatch):
     assert early_return_reason("anything") is None
 
 
-# --- referenced_providers --------------------------------------------------
-
-
-def test_referenced_providers_model_block():
-    full = {"model": {"provider": "openai"}}
-    cfg = parse({"model_alias_to_all_provider_aliases": {"a": {"match": "x*"}}})
-    assert list(referenced_providers(full, cfg).keys()) == ["openai"]
-
-
-def test_referenced_providers_auxiliary_fallback_delegation_smart_routing():
-    full = {
-        "model": {"provider": "openai"},
-        "auxiliary": {"coder": {"provider": "anthropic"}, "vision": {"provider": "auto"}},
-        "fallback_providers": [{"provider": "google"}, {"provider": ""}],
-        "delegation": {"provider": "groq"},
-        "smart_model_routing": {"cheap_model": {"provider": "deepseek"}},
-    }
-    cfg = parse({"model_alias_to_all_provider_aliases": {"a": {"match": "x*"}}})
-    names = list(referenced_providers(full, cfg).keys())
-    assert names == ["openai", "anthropic", "google", "groq", "deepseek"]
-
-
-def test_referenced_providers_custom_list_and_dict():
-    full = {
-        "custom_providers": [
-            {"name": "local", "api": "http://127.0.0.1:9/v1"},
-        ],
-        "providers": {
-            "legacy": {"api": "http://legacy.example/v1"},
-        },
-    }
-    cfg = parse({"model_alias_to_all_provider_aliases": {"a": {"match": "x*"}}})
-    refs = referenced_providers(full, cfg)
-    assert list(refs.keys()) == ["local", "legacy"]
-    assert refs["local"]["api"] == "http://127.0.0.1:9/v1"
-    assert refs["legacy"]["api"] == "http://legacy.example/v1"
-
-
-def test_referenced_providers_wrap_all(monkeypatch):
-    class P1:
-        name = "alpha"
-
-    class P2:
-        name = "beta"
-
-    pkg = sys.modules.get("providers")
-    if pkg is None:
-        pkg = types.ModuleType("providers")
-        monkeypatch.setitem(sys.modules, "providers", pkg)
-    pkg.list_providers = lambda: [P1(), P2()]
-    cfg = parse({"wrap_all": True, "model_alias_to_all_provider_aliases": {"a": {"match": "x*"}}})
-    refs = referenced_providers({}, cfg)
-    assert list(refs.keys()) == ["alpha", "beta"]
-
-
-def test_referenced_providers_skips_group_keys():
-    full = {"model": {"provider": "ocg-alias"}}
-    cfg = parse({
-        "provider_alias_to_many_model_aliases": {
-            "ocg-alias": {"provider": "opencode-go", "fast": {"match": "x*"}},
-        },
-    })
-    refs = referenced_providers(full, cfg)
-    assert "ocg-alias" not in refs
-
-
-# --- resolve_group_provider ladder -----------------------------------------
-
-
-def test_resolve_group_provider_name_join_custom_entry():
-    full = {
-        "custom_providers": [
-            {"name": "ocg-alias", "api": "http://custom.example/v1", "key_env": "CUSTOM_KEY"},
-        ],
-    }
-    group = ProviderGroup(key="ocg-alias", provider="opencode-go", aliases={"fast": AliasSpec(match=("tcl-*",))})
-    name, entry, prof, desc = resolve_group_provider(group, full)
-    assert name == "ocg-alias"
-    assert entry["api"] == "http://custom.example/v1"
-    assert prof.base_url == "http://custom.example/v1"
-    assert desc.base_url == "http://custom.example/v1"
-
-
-def test_resolve_group_provider_bundled_provider(monkeypatch, fake_opencode_profile):
-    pkg = sys.modules["providers"]
-    pkg.get_provider_profile = lambda name: fake_opencode_profile if name == "opencode-go" else None
-    group = ProviderGroup(key="ocg-alias", provider="opencode-go", aliases={"fast": AliasSpec(match=("tcl-*",))})
-    name, entry, prof, desc = resolve_group_provider(group, {})
-    assert name == "opencode-go"
-    assert entry is None
-    assert prof is fake_opencode_profile
-    assert desc.name == "opencode-go"
-    assert desc.models_dev_id == "targetco"
-
-
-def test_resolve_group_provider_slug_prefix_custom_entry():
-    full = {
-        "custom_providers": [
-            {"name": "work", "api": "http://work.example/v1", "model": "opencode-go/glm-4o"},
-        ],
-    }
-    group = ProviderGroup(key="ocg-alias", provider="opencode-go", aliases={"fast": AliasSpec(match=("tcl-*",))})
-    name, entry, prof, desc = resolve_group_provider(group, full)
-    assert name == "work"
-    assert entry["model"] == "opencode-go/glm-4o"
-    assert prof.base_url == "http://work.example/v1"
-
-
-def test_resolve_group_provider_default_model_slug_prefix():
-    full = {
-        "custom_providers": [
-            {"name": "work", "api": "http://work.example/v1", "default_model": "opencode-go/xyz"},
-        ],
-    }
-    group = ProviderGroup(key="ocg-alias", provider="opencode-go", aliases={"fast": AliasSpec(match=("tcl-*",))})
-    name, entry, prof, desc = resolve_group_provider(group, full)
-    assert name == "work"
-
-
-def test_resolve_group_provider_nothing_matches():
-    group = ProviderGroup(key="ocg-alias", provider="opencode-go", aliases={"fast": AliasSpec(match=("tcl-*",))})
-    with pytest.raises(TargetError, match="opencode-go"):
-        resolve_group_provider(group, {})
-
-
-def test_resolve_group_provider_name_join_missing_api():
-    full = {
-        "custom_providers": [
-            {"name": "ocg-alias"},
-        ],
-    }
-    group = ProviderGroup(key="ocg-alias", provider="opencode-go", aliases={"fast": AliasSpec(match=("tcl-*",))})
-    with pytest.raises(TargetError, match="api/base_url"):
-        resolve_group_provider(group, full)
-
-
-# --- resolve_target --------------------------------------------------------
 
 
 def test_resolve_warm_cache_zero_network(tmp_path, monkeypatch, models_dev):
@@ -324,8 +176,8 @@ def test_resolve_warm_cache_zero_network(tmp_path, monkeypatch, models_dev):
     monkeypatch.setattr(plugin_mod, "_memo_models_dev", explode)
     monkeypatch.setattr(plugin_mod, "fetch_live_ids", explode)
 
-    cfg = parse(_cfg_raw_global())
-    alias_map = dict(cfg.aliases)
+    cfg = parse(_cfg_raw_groups())
+    alias_map = dict(cfg.groups["ocg-alias"].aliases)
     resolved, caps, rid_meta, real_ids = resolve_target(
         cfg, "targetco", _desc(), tmp_path, alias_map
     )
@@ -338,8 +190,8 @@ def test_resolve_warm_cache_zero_network(tmp_path, monkeypatch, models_dev):
 def test_resolve_cold_saves_state_and_capabilities(tmp_path, monkeypatch, models_dev):
     monkeypatch.setattr(plugin_mod, "_memo_models_dev", lambda: models_dev)
     monkeypatch.setattr(plugin_mod, "fetch_live_ids", lambda desc, timeout=3.0: None)
-    cfg = parse(_cfg_raw_global())
-    alias_map = dict(cfg.aliases)
+    cfg = parse(_cfg_raw_groups())
+    alias_map = dict(cfg.groups["ocg-alias"].aliases)
     resolved, caps, rid_meta, real_ids = resolve_target(cfg, "targetco", _desc(), tmp_path, alias_map)
     assert resolved["fast"] == "tcl-4.1"
     saved = state.load(tmp_path, CACHE_KEY)
@@ -354,8 +206,8 @@ def test_resolve_drift_logged_and_recorded(tmp_path, monkeypatch, models_dev, ca
     state.save(tmp_path, CACHE_KEY, seed)
     monkeypatch.setattr(plugin_mod, "_memo_models_dev", lambda: models_dev)
     monkeypatch.setattr(plugin_mod, "fetch_live_ids", lambda desc, timeout=3.0: None)
-    cfg = parse(_cfg_raw_global())
-    alias_map = dict(cfg.aliases)
+    cfg = parse(_cfg_raw_groups())
+    alias_map = dict(cfg.groups["ocg-alias"].aliases)
     with caplog.at_level(logging.WARNING, logger="model-aliases"):
         resolved, _c, _r, _ri = resolve_target(cfg, "targetco", _desc(), tmp_path, alias_map)
     assert resolved["fast"] == "tcl-4.1"
@@ -367,8 +219,8 @@ def test_resolve_drift_logged_and_recorded(tmp_path, monkeypatch, models_dev, ca
 def test_resolve_strict_raises_on_unresolved(tmp_path, monkeypatch):
     monkeypatch.setattr(plugin_mod, "_memo_models_dev", lambda: {})
     monkeypatch.setattr(plugin_mod, "fetch_live_ids", lambda desc, timeout=3.0: None)
-    cfg = parse({**_cfg_raw_global(), "strict": True})
-    alias_map = dict(cfg.aliases)
+    cfg = parse({**_cfg_raw_groups(), "strict": True})
+    alias_map = dict(cfg.groups["ocg-alias"].aliases)
     with pytest.raises(TargetError, match="fast"):
         resolve_target(cfg, "targetco", _desc(), tmp_path, alias_map)
 
@@ -376,8 +228,8 @@ def test_resolve_strict_raises_on_unresolved(tmp_path, monkeypatch):
 def test_resolve_tolerant_logs_error_on_unresolved(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(plugin_mod, "_memo_models_dev", lambda: {})
     monkeypatch.setattr(plugin_mod, "fetch_live_ids", lambda desc, timeout=3.0: None)
-    cfg = parse(_cfg_raw_global())
-    alias_map = dict(cfg.aliases)
+    cfg = parse(_cfg_raw_groups())
+    alias_map = dict(cfg.groups["ocg-alias"].aliases)
     with caplog.at_level(logging.ERROR, logger="model-aliases"):
         resolved, _c, _r, _ri = resolve_target(cfg, "targetco", _desc(), tmp_path, alias_map)
     assert resolved == {}
@@ -390,8 +242,8 @@ def test_resolve_tolerant_keeps_last_known_good_when_fetches_fail(tmp_path, monk
 
     monkeypatch.setattr(plugin_mod, "_memo_models_dev", lambda: None)
     monkeypatch.setattr(plugin_mod, "fetch_live_ids", lambda desc, timeout=3.0: None)
-    cfg = parse(_cfg_raw_global())
-    alias_map = dict(cfg.aliases)
+    cfg = parse(_cfg_raw_groups())
+    alias_map = dict(cfg.groups["ocg-alias"].aliases)
     resolved, _c, _r, _ri = resolve_target(cfg, "targetco", _desc(), tmp_path, alias_map)
     assert resolved == {"fast": "tcl-4.1"}  # network dead -> last known good survives
 
@@ -438,29 +290,14 @@ def test_register_all_registers_group_wrapped_under_target_and_group_names(
 
 
 def test_register_all_custom_entry_extra_alias(tmp_path, monkeypatch, stub_providers, models_dev):
+    """Name join: a group whose key equals the custom entry's name gets the
+    custom:<name> claim on its wrap."""
     monkeypatch.setattr(plugin_mod, "_memo_models_dev", lambda: models_dev)
     monkeypatch.setattr(plugin_mod, "fetch_live_ids", lambda desc, timeout=3.0: None)
-    _run_register_all(monkeypatch, tmp_path, _cfg_raw_global(), _custom_full())
+    raw = {"provider_alias_to_many_model_aliases": {"local": {"provider": "local", "fast": {"match": ["tcl-*"]}}}}
+    _run_register_all(monkeypatch, tmp_path, raw, _custom_full())
     p = stub_providers[0]
     assert "custom:local" in p.aliases
-
-
-def test_register_all_global_only_wraps_referenced_provider(
-    tmp_path, monkeypatch, stub_providers, models_dev, fake_opencode_profile
-):
-    monkeypatch.setattr(plugin_mod, "_memo_models_dev", lambda: models_dev)
-    monkeypatch.setattr(plugin_mod, "fetch_live_ids", lambda desc, timeout=3.0: None)
-    pkg = sys.modules["providers"]
-    pkg.get_provider_profile = lambda name: fake_opencode_profile if name == "opencode-go" else None
-
-    full = {"model": {"provider": "opencode-go"}}
-    _run_register_all(monkeypatch, tmp_path, _cfg_raw_global(), full)
-
-    assert [p.name for p in stub_providers] == ["opencode-go"]
-    p = stub_providers[0]
-    assert p.normalize_model_id("fast") == "tcl-4.1"
-    # Global-only target has no group extra aliases.
-    assert "custom:opencode-go" not in p.aliases
 
 
 def test_register_all_strict_registers_nothing_with_ghost_group(
@@ -535,8 +372,8 @@ def test_register_all_custom_entry_alias_model_warning(
     monkeypatch.setattr(plugin_mod, "fetch_live_ids", lambda desc, timeout=3.0: None)
 
     raw = {
-        "model_alias_to_all_provider_aliases": {
-            "fast": {"match": ["tcl-*"]},  # known alias; will not match aggco models
+        "provider_alias_to_many_model_aliases": {
+            "work": {"provider": "work", "fast": {"match": ["tcl-*"]}},  # known alias; will not match aggco models
         },
     }
     full = {
@@ -564,8 +401,8 @@ def test_register_all_custom_entry_alias_model_strict_error(
 ):
     raw = {
         "strict": True,
-        "model_alias_to_all_provider_aliases": {
-            "fast": {"match": ["tcl-*"]},
+        "provider_alias_to_many_model_aliases": {
+            "work": {"provider": "work", "fast": {"match": ["tcl-*"]}},
         },
     }
     full = {
@@ -620,6 +457,7 @@ def test_ladder_prefix_boundary(tmp_path, monkeypatch, stub_providers, caplog):
     full = {"custom_providers": [{"name": "gptx", "api": "https://x/v1", "model": "gptx-9b"}]}
     _install_fake_hermes(monkeypatch, canonical=None)
     _run_register_all(monkeypatch, tmp_path, raw, full)
-    assert [p.name for p in stub_providers] == ["gptx"]  # sweep wraps the entry
-    # the GROUP failed the boundary rule and was reported
+    # No global sweep anymore: the entry is only wrapped via a group, and the
+    # group failed the boundary rule -> nothing registered.
+    assert stub_providers == []
     assert any("slug prefix 'gpt'" in r.message for r in caplog.records), caplog.records

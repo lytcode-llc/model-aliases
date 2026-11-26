@@ -8,8 +8,9 @@ claimed under the real provider name, every group name targeting it, and the
 custom forms — so every consumer block just writes the developer's chosen
 provider alias.
 
-Tolerant by default: a target that cannot be served or an alias with no
-match on it logs loudly; ``model_aliases.strict`` turns any of it into a load
+Wraps exist ONLY for provider-alias groups (the global scope is shelved — see
+PLAN.md BACKLOG). Tolerant by default: a target that cannot be served or an
+alias with no match on it logs loudly; ``model_aliases.strict`` turns any of it into a load
 failure (nothing registered, Hermes logs the import error). Startup budget:
 eager resolution runs concurrently across targets behind one shared
 models.dev fetch — bounded well inside Hermes' 10s plugin load timeout.
@@ -136,14 +137,6 @@ def early_return_reason(name: str) -> str | None:
 
 # --- provider discovery ------------------------------------------------------
 
-def _add_referenced(store: dict[str, Any], provider: Any, entry: dict | None) -> None:
-    name = str(provider or "").strip()
-    if not name or name.lower() in {"auto", "none", "custom"}:
-        return  # 'custom' is the generic bucket — wrapping it logs noise forever
-    if name not in store:
-        store[name] = entry  # first mention wins; entry None = bundled
-
-
 def _is_provider_block(item: Any) -> bool:
     return isinstance(item, dict) and any(k in item for k in ("api", "base_url", "url"))
 
@@ -161,57 +154,6 @@ def _custom_entry_for(name: str, full: dict) -> dict | None:
             if _is_provider_block(item):
                 return item
     return None
-
-
-def referenced_providers(full: dict, cfg: AliasesConfig) -> dict[str, dict | None]:
-    """Every provider name referenced anywhere in config (-> custom entry or None).
-    Group keys are handled separately by the group loop. When wrap_all is set,
-    every registered provider joins the map."""
-    store: dict[str, Any] = {}
-
-    def _ref(provider: Any) -> None:
-        name = str(provider or "").strip()
-        if name and name not in cfg.groups:
-            _add_referenced(store, name, _custom_entry_for(name, full))
-
-    model_cfg = full.get("model") if isinstance(full.get("model"), dict) else {}
-    _ref(model_cfg.get("provider"))
-
-    aux = full.get("auxiliary") if isinstance(full.get("auxiliary"), dict) else {}
-    for task, tcfg in aux.items():
-        if isinstance(tcfg, dict):
-            _ref(tcfg.get("provider"))
-
-    for fb in (full.get("fallback_providers") or []):
-        if isinstance(fb, dict):
-            _ref(fb.get("provider"))
-
-    deleg = full.get("delegation") if isinstance(full.get("delegation"), dict) else {}
-    _ref(deleg.get("provider"))
-
-    smr = full.get("smart_model_routing") if isinstance(full.get("smart_model_routing"), dict) else {}
-    cheap = smr.get("cheap_model") if isinstance(smr.get("cheap_model"), dict) else {}
-    _ref(cheap.get("provider"))
-
-    for block in (full.get("custom_providers"), full.get("providers")):
-        if isinstance(block, list):
-            for item in block:
-                if isinstance(item, dict) and item.get("name"):
-                    _add_referenced(store, str(item["name"]).strip(), item)
-        elif isinstance(block, dict):
-            for key, item in block.items():
-                if _is_provider_block(item):
-                    _add_referenced(store, key, item)
-
-    if cfg.wrap_all:
-        try:
-            from providers import list_providers
-
-            for prof in list_providers():
-                _add_referenced(store, prof.name, None)
-        except Exception:
-            logger.debug("model-aliases: list_providers failed for wrap_all", exc_info=True)
-    return store
 
 
 # --- slug-prefix -> provider ladder ------------------------------------------
@@ -464,7 +406,7 @@ def register_all() -> None:
         # way) — only the visibility changes.
         logger.error("model-aliases: invalid config: %s", e)
         raise ConfigError(f"invalid config: {e}") from e
-    if not cfg.groups and not cfg.aliases:
+    if not cfg.groups:
         return
     try:
         from providers import register_provider
@@ -530,43 +472,10 @@ def register_all() -> None:
                 )
         t["groups"][group.key] = group.aliases
 
-    for name, entry in referenced_providers(full, cfg).items():
-        if name in targets:
-            continue
-        try:
-            from providers import get_provider_profile
-
-            if entry is None:
-                prof = get_provider_profile(name)
-                if prof is None:
-                    raise TargetError(f"unknown provider {name!r} (not bundled, not under custom_providers/providers:)")
-                desc = ProviderDescriptor(
-                    name=name,
-                    base_url=prof.base_url,
-                    models_url=prof.models_url,
-                    models_dev_id=prof.models_dev_id or "",
-                    api_key_env=next((v for v in (prof.env_vars or ()) if not str(v).endswith("_URL")), ""),
-                )
-            else:
-                prof = build_custom_profile(name, entry)
-                if not prof.base_url:
-                    raise TargetError(f"custom provider {name!r} has no api/base_url")
-                desc = ProviderDescriptor(
-                    name=name,
-                    base_url=prof.base_url,
-                    models_dev_id=prof.models_dev_id,
-                    api_key_env=str(entry.get("key_env") or entry.get("api_key_env") or "").strip(),
-                )
-            targets[name] = {"entry": entry, "prof": prof, "desc": desc, "groups": {}, "is_custom": entry is not None}
-        except TargetError as e:
-            errors.append(str(e))
-        except Exception as e:
-            errors.append(f"provider {name!r}: {type(e).__name__}: {e}")
-            logger.debug("model-aliases: provider %s failed", name, exc_info=True)
-
-    # --- resolve every target's union scope (global + its groups) ---
+    # --- resolve each target's scope (the groups targeting it; groups sharing
+    # a target share one resolution) ---
     def _union_scope(t: dict[str, Any]) -> dict[str, AliasSpec]:
-        scope = dict(cfg.aliases)
+        scope: dict[str, AliasSpec] = {}
         for galiases in t["groups"].values():
             scope.update(galiases)
         return scope
@@ -641,7 +550,7 @@ def register_all() -> None:
         if not entry:
             continue
         slug = str(entry.get("model") or entry.get("default_model") or "").strip().lower()
-        target_known = {s.lower() for s in cfg.aliases}
+        target_known: set[str] = set()
         for galiases in t["groups"].values():
             target_known.update(s.lower() for s in galiases)
         if not slug or slug not in target_known:

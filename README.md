@@ -34,20 +34,19 @@ plugin for OpenCode.
 
 ## What it is
 
-- Two scopes under `model_aliases:` in `~/.hermes/config.yaml`:
-  - `provider_alias_to_many_model_aliases`: provider-alias **groups** that you name.
-    Each group targets one provider and holds that provider's model aliases.
-  - `model_alias_to_all_provider_aliases`: **global** aliases, resolved on every
-    wrapped provider.
+- One scope under `model_aliases:` in `~/.hermes/config.yaml`:
+  `provider_alias_to_many_model_aliases` — provider-alias **groups** that you
+  name. Each group targets one provider and holds that provider's model aliases.
+  (The former global `model_alias_to_all_provider_aliases` scope is shelved —
+  see the BACKLOG in `PLAN.md`.)
 - You choose the group names. The plugin never invents provider alias names, and a
   group name that Hermes would never route to a provider profile is rejected at load.
 - A group name is the provider you write in every consumer block
   (`model.provider`, `auxiliary.<task>.provider`, `fallback_providers[].provider`,
   `delegation.provider`), so an alias id works wherever a (provider, model) pair
   appears: main model, auxiliary tasks, fallbacks, the `/model` picker, delegation.
-- The plugin wraps the targets your config references (the providers it names, plus
-  the target of every group), so credential pools, `auth_type`, env var ladders and
-  registry sync keep working unchanged.
+- The plugin wraps only the targets of your groups, so credential pools,
+  `auth_type`, env var ladders and registry sync keep working unchanged.
 - Standard library only. No third-party dependencies to install.
 
 There is no flat top-level alias table and no auto-generated `alias-<provider>` name.
@@ -106,12 +105,11 @@ consumers (concrete ids on early-return families still flow through the bundled
 profile's own repairs). Two groups that resolve to the same target share one
 resolution (one cache file, one state) but each gets its own group-name wrap.
 
-### 2. The two scopes
+### 2. The scope
 
 | Scope | Key | Resolved on |
 | --- | --- | --- |
 | Provider-alias group | `provider_alias_to_many_model_aliases` | The group's target provider only. |
-| Global | `model_alias_to_all_provider_aliases` | Every wrapped provider. |
 
 A group's body is a mapping: the reserved `provider` key plus the group's model
 aliases as direct siblings.
@@ -123,15 +121,10 @@ model_aliases:
       provider: opencode-go          # reserved key: the target's model-slug prefix
       glm-latest:                    # a model alias, a direct sibling of `provider`
         match: ["opencode-go/glm-*"]
-
-  model_alias_to_all_provider_aliases:
-    mimo-pro-latest:                 # resolved on every wrapped provider
-      match: ["mimo-*-pro"]
 ```
 
-A target's effective alias scope is the global aliases plus the aliases of every
-group targeting it. When a group and the global scope use the same slug, the group
-wins for that target.
+A target's alias scope is the union of the aliases of every group targeting it;
+groups that share a target share one resolution.
 
 ### 3. Naming a group: the slug-prefix ladder
 
@@ -296,7 +289,6 @@ unrecognized keys.
 
 ```yaml
 model_aliases:
-  wrap_all: false       # true: also wrap providers the config does not reference
   strict: false         # true: fail the plugin load instead of degrading
   debug: false          # log every resolution
   refresh_seconds: 3600 # how long a cached resolution is trusted
@@ -317,9 +309,6 @@ model_aliases:
         select:
           strategy: latest        # only 'latest' is supported
 
-  model_alias_to_all_provider_aliases:
-    mimo-pro-latest:              # resolved on every wrapped provider
-      match: ["mimo-*-pro"]
 ```
 
 A ready-to-paste block is in [`examples/hermes-config.yaml`](examples/hermes-config.yaml).
@@ -329,8 +318,6 @@ A ready-to-paste block is in [`examples/hermes-config.yaml`](examples/hermes-con
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `provider_alias_to_many_model_aliases` | mapping | `{}` | Developer-named provider-alias groups. |
-| `model_alias_to_all_provider_aliases` | mapping | `{}` | Global aliases, resolved on every wrapped provider. |
-| `wrap_all` | boolean | `false` | Also wrap every registered provider, not only the referenced ones. |
 | `strict` | boolean | `false` | Turn any resolution failure into a plugin load failure. |
 | `debug` | boolean | `false` | Log each resolution and the list of registered providers. |
 | `refresh_seconds` | positive integer | `3600` | Age at which a cached resolution is considered stale. |
@@ -351,11 +338,6 @@ A mapping of group key to group body.
 A group must declare at least one model alias. `provider` is reserved: it is never
 read as an alias.
 
-### `model_alias_to_all_provider_aliases`
-
-A mapping of alias slug to alias spec, exactly as in a group. These slugs are
-resolved on every wrapped provider.
-
 ### `<alias>`
 
 | Key | Type | Required | Meaning |
@@ -374,19 +356,6 @@ may be omitted; `latest` is the only strategy implemented.
 
 Alias lookup is case-insensitive: `normalize_model_id("GLM-LATEST")` resolves the same
 as `glm-latest`.
-
-### `wrap_all`
-
-`false` (default): wrap only the providers the config references, plus the targets of
-your groups. That keeps the number of live catalog fetches small and the startup
-inside Hermes' 10 second plugin load budget (`plugins.load_timeout_seconds`).
-
-`true`: wrap every registered provider too, including ones the config never mentions.
-
-Both modes resolve eagerly at import. There is no lazy path: `normalize_model_id()`
-has to stay free of I/O, so the resolution happens once, at load, behind one shared
-models.dev fetch, with the per-provider fetches running concurrently. The result is
-held in memory for the life of the process.
 
 ### Custom providers
 
