@@ -6,7 +6,7 @@ You declare a stable model id once (`glm-latest`) and the plugin resolves it to 
 newest matching model your provider actually offers, every time Hermes starts. When
 the provider ships a newer release, the alias follows it. No config edits.
 
-Aliases live in one of two scopes, and you name the provider aliases yourself, so an
+Aliases live in one scope — provider-alias groups you name yourself — so an
 alias also resolves on the provider families whose generic normalization would
 otherwise swallow it.
 
